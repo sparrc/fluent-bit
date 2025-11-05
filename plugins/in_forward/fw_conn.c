@@ -45,7 +45,25 @@ int fw_conn_event(void *data)
 
     conn = connection->user_data;
 
+    /* Check if connection is still valid */
+    if (!conn) {
+        return -1;
+    }
+
     ctx = conn->ctx;
+
+    /*
+     * Acquire mutex to check if plugin is paused.
+     * If paused, the connection may have been deleted, so exit early.
+     */
+    pthread_mutex_lock(&ctx->conn_mutex);
+
+    if (ctx->is_paused) {
+        pthread_mutex_unlock(&ctx->conn_mutex);
+        return -1;
+    }
+
+    pthread_mutex_unlock(&ctx->conn_mutex);
 
     event = &connection->event;
 
@@ -141,6 +159,7 @@ struct fw_conn *fw_conn_add(struct flb_connection *connection, struct flb_in_fw_
         return NULL;
     }
 
+    conn->being_deleted = 0;
     conn->handshake_status = FW_HANDSHAKE_ESTABLISHED;
     /*
      * Always force the secure-forward handshake when:
@@ -225,6 +244,12 @@ struct fw_conn *fw_conn_add(struct flb_connection *connection, struct flb_in_fw_
 
 int fw_conn_del(struct fw_conn *conn)
 {
+    /*
+     * Set being_deleted flag to prevent any in-flight processing
+     * from accessing this connection's resources
+     */
+    conn->being_deleted = 1;
+
     /* The downstream unregisters the file descriptor from the event-loop
      * so there's nothing to be done by the plugin
      */
@@ -236,6 +261,7 @@ int fw_conn_del(struct fw_conn *conn)
     /* Release decompression context if it exists */
     if (conn->d_ctx) {
         flb_decompression_context_destroy(conn->d_ctx);
+        conn->d_ctx = NULL;
     }
 
     if (conn->helo != NULL) {
@@ -246,8 +272,15 @@ int fw_conn_del(struct fw_conn *conn)
             flb_sds_destroy(conn->helo->salt);
         }
         flb_free(conn->helo);
+        conn->helo = NULL;
     }
-    flb_free(conn->buf);
+
+    /* Free buffer and set to NULL to prevent use-after-free */
+    if (conn->buf) {
+        flb_free(conn->buf);
+        conn->buf = NULL;
+    }
+
     flb_free(conn);
 
     return 0;

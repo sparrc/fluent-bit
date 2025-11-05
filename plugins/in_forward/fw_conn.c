@@ -43,9 +43,32 @@ int fw_conn_event(void *data)
 
     connection = (struct flb_connection *) data;
 
+    /* Validate connection has user data */
+    if (!connection || !connection->user_data) {
+        return -1;
+    }
+
     conn = connection->user_data;
 
+    /* Validate connection context */
+    if (!conn || !conn->ctx) {
+        return -1;
+    }
+
     ctx = conn->ctx;
+
+    /* Check if plugin is paused - if so, don't process events */
+    ret = pthread_mutex_lock(&ctx->conn_mutex);
+    if (ret != 0) {
+        return -1;
+    }
+
+    if (ctx->is_paused) {
+        pthread_mutex_unlock(&ctx->conn_mutex);
+        return -1;
+    }
+
+    pthread_mutex_unlock(&ctx->conn_mutex);
 
     event = &connection->event;
 
@@ -225,6 +248,11 @@ struct fw_conn *fw_conn_add(struct flb_connection *connection, struct flb_in_fw_
 
 int fw_conn_del(struct fw_conn *conn)
 {
+    /* Clear user_data to prevent use-after-free */
+    if (conn->connection) {
+        conn->connection->user_data = NULL;
+    }
+
     /* The downstream unregisters the file descriptor from the event-loop
      * so there's nothing to be done by the plugin
      */

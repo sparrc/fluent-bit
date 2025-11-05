@@ -1076,8 +1076,13 @@ static size_t receiver_recv(struct fw_conn *conn, char *buf, size_t try_size) {
     size_t off;
     size_t actual_size;
 
-    /* Safety check: ensure connection buffer exists */
-    if (!conn->buf) {
+    /* Safety check: ensure connection and buffer are valid */
+    if (!conn || !conn->buf) {
+        return 0;
+    }
+
+    /* Additional safety check for buffer bounds */
+    if (conn->buf_len < conn->rest) {
         return 0;
     }
 
@@ -1086,6 +1091,11 @@ static size_t receiver_recv(struct fw_conn *conn, char *buf, size_t try_size) {
 
     if (actual_size > conn->rest) {
         actual_size = conn->rest;
+    }
+
+    /* Final safety check before memcpy */
+    if (actual_size == 0 || off >= conn->buf_len) {
+        return 0;
     }
 
     memcpy(buf, conn->buf + off, actual_size);

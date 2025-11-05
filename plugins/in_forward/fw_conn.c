@@ -45,6 +45,11 @@ int fw_conn_event(void *data)
 
     conn = connection->user_data;
 
+    /* Check if connection is still valid */
+    if (!conn) {
+        return -1;
+    }
+
     ctx = conn->ctx;
 
     event = &connection->event;

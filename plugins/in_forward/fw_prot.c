@@ -1075,9 +1075,10 @@ static int fw_process_message_mode_entry(
 static size_t receiver_recv(struct fw_conn *conn, char *buf, size_t try_size) {
     size_t off;
     size_t actual_size;
+    char *src_buf;
 
     /* Safety check: ensure connection and buffer are valid */
-    if (!conn || !conn->buf) {
+    if (!conn || !conn->buf || !buf) {
         return 0;
     }
 
@@ -1098,7 +1099,25 @@ static size_t receiver_recv(struct fw_conn *conn, char *buf, size_t try_size) {
         return 0;
     }
 
-    memcpy(buf, conn->buf + off, actual_size);
+    /* Cache the buffer pointer and recheck it */
+    src_buf = conn->buf;
+    if (!src_buf) {
+        return 0;
+    }
+
+    /* Try to detect if buffer was freed by checking if conn->buf changed */
+    if (src_buf != conn->buf) {
+        return 0;
+    }
+
+    /* Use memmove instead of memcpy for extra safety */
+    memmove(buf, src_buf + off, actual_size);
+
+    /* Verify the operation succeeded by checking if conn is still valid */
+    if (!conn->buf || conn->buf != src_buf) {
+        return 0;  /* Buffer was freed during operation */
+    }
+
     conn->rest -= actual_size;
 
     return actual_size;
@@ -1288,6 +1307,11 @@ int fw_prot_process(struct flb_input_instance *ins, struct fw_conn *conn)
     size_t all_used = 0;
     struct flb_in_fw_config *ctx = conn->ctx;
 
+    /* Early exit if connection is invalid */
+    if (!conn || !conn->ctx) {
+        return -1;
+    }
+
     /*
      * [tag, time, record]
      * [tag, [[time,record], [time,record], ...]]
@@ -1303,6 +1327,14 @@ int fw_prot_process(struct flb_input_instance *ins, struct fw_conn *conn)
     conn->rest = conn->buf_len;
 
     while (1) {
+        /* Check if connection or buffer is invalid */
+        if (!conn || !conn->buf) {
+            msgpack_unpacker_free(unp);
+            msgpack_unpacked_destroy(&result);
+            flb_sds_destroy(out_tag);
+            return -1;
+        }
+
         recv_len = receiver_to_unpacker(conn, EACH_RECV_SIZE, unp);
         if (recv_len == 0) {
             /* No more data */

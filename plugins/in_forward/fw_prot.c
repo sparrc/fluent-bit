@@ -1076,6 +1076,11 @@ static size_t receiver_recv(struct fw_conn *conn, char *buf, size_t try_size) {
     size_t off;
     size_t actual_size;
 
+    /* Safety check: ensure connection buffer exists */
+    if (!conn->buf) {
+        return 0;
+    }
+
     off = conn->buf_len - conn->rest;
     actual_size = try_size;
 

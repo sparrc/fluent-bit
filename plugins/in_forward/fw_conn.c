@@ -247,7 +247,13 @@ int fw_conn_del(struct fw_conn *conn)
         }
         flb_free(conn->helo);
     }
-    flb_free(conn->buf);
+
+    /* Free buffer and set to NULL to prevent use-after-free */
+    if (conn->buf) {
+        flb_free(conn->buf);
+        conn->buf = NULL;
+    }
+
     flb_free(conn);
 
     return 0;

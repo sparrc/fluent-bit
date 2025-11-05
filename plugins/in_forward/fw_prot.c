@@ -1075,15 +1075,31 @@ static int fw_process_message_mode_entry(
 static size_t receiver_recv(struct fw_conn *conn, char *buf, size_t try_size) {
     size_t off;
     size_t actual_size;
-    char *src_buf;
+    size_t result = 0;
+    struct flb_in_fw_config *ctx;
 
     /* Safety check: ensure connection and buffer are valid */
-    if (!conn || !conn->buf || !buf) {
+    if (!conn || !buf) {
+        return 0;
+    }
+
+    ctx = conn->ctx;
+    if (!ctx) {
+        return 0;
+    }
+
+    /* Lock mutex to protect buffer access */
+    pthread_mutex_lock(&ctx->conn_mutex);
+
+    /* Check buffer validity while holding the lock */
+    if (!conn->buf) {
+        pthread_mutex_unlock(&ctx->conn_mutex);
         return 0;
     }
 
     /* Additional safety check for buffer bounds */
     if (conn->buf_len < conn->rest) {
+        pthread_mutex_unlock(&ctx->conn_mutex);
         return 0;
     }
 
@@ -1096,31 +1112,18 @@ static size_t receiver_recv(struct fw_conn *conn, char *buf, size_t try_size) {
 
     /* Final safety check before memcpy */
     if (actual_size == 0 || off >= conn->buf_len) {
+        pthread_mutex_unlock(&ctx->conn_mutex);
         return 0;
     }
 
-    /* Cache the buffer pointer and recheck it */
-    src_buf = conn->buf;
-    if (!src_buf) {
-        return 0;
-    }
-
-    /* Try to detect if buffer was freed by checking if conn->buf changed */
-    if (src_buf != conn->buf) {
-        return 0;
-    }
-
-    /* Use memmove instead of memcpy for extra safety */
-    memmove(buf, src_buf + off, actual_size);
-
-    /* Verify the operation succeeded by checking if conn is still valid */
-    if (!conn->buf || conn->buf != src_buf) {
-        return 0;  /* Buffer was freed during operation */
-    }
-
+    /* Now safe to access buffer - mutex protects us */
+    memcpy(buf, conn->buf + off, actual_size);
     conn->rest -= actual_size;
+    result = actual_size;
 
-    return actual_size;
+    pthread_mutex_unlock(&ctx->conn_mutex);
+
+    return result;
 }
 
 static size_t receiver_to_unpacker(struct fw_conn *conn, size_t request_size,

@@ -230,6 +230,8 @@ struct fw_conn *fw_conn_add(struct flb_connection *connection, struct flb_in_fw_
 
 int fw_conn_del(struct fw_conn *conn)
 {
+    struct flb_in_fw_config *ctx = conn->ctx;
+
     /* The downstream unregisters the file descriptor from the event-loop
      * so there's nothing to be done by the plugin
      */
@@ -253,11 +255,16 @@ int fw_conn_del(struct fw_conn *conn)
         flb_free(conn->helo);
     }
 
+    /* Lock mutex before freeing buffer to prevent race with receiver_recv */
+    pthread_mutex_lock(&ctx->conn_mutex);
+
     /* Free buffer and set to NULL to prevent use-after-free */
     if (conn->buf) {
         flb_free(conn->buf);
         conn->buf = NULL;
     }
+
+    pthread_mutex_unlock(&ctx->conn_mutex);
 
     flb_free(conn);
 

@@ -43,6 +43,7 @@ struct flb_in_fw_helo;
 struct fw_conn {
     int status;                      /* Connection status                 */
     int handshake_status;            /* handshake status                 */
+    int being_deleted;               /* Flag: connection is being deleted */
 
     /* Buffer */
     char *buf;                       /* Buffer data                       */

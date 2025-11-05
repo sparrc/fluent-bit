@@ -1016,7 +1016,10 @@ static int fw_process_message_mode_entry(
     msgpack_object   options;
     int              result;
     msgpack_object   chunk;
+    struct flb_in_fw_config *ctx;
 
+    /* Save ctx pointer before any operation that might delete the connection */
+    ctx = conn->ctx;
     metadata = NULL;
 
     if (chunk_id != -1 || metadata_id != -1) {
@@ -1030,39 +1033,47 @@ static int fw_process_message_mode_entry(
     result = flb_log_event_decoder_decode_timestamp(ts, &timestamp);
 
     if (result == FLB_EVENT_ENCODER_SUCCESS) {
-        result = flb_log_event_encoder_begin_record(conn->ctx->log_encoder);
+        result = flb_log_event_encoder_begin_record(ctx->log_encoder);
     }
 
     if (result == FLB_EVENT_ENCODER_SUCCESS) {
-        result = flb_log_event_encoder_set_timestamp(conn->ctx->log_encoder,
+        result = flb_log_event_encoder_set_timestamp(ctx->log_encoder,
                                                      &timestamp);
     }
 
     if (result == FLB_EVENT_ENCODER_SUCCESS) {
         if (metadata != NULL) {
             result = flb_log_event_encoder_set_metadata_from_msgpack_object(
-                        conn->ctx->log_encoder,
+                        ctx->log_encoder,
                         metadata);
         }
     }
 
     if (result == FLB_EVENT_ENCODER_SUCCESS) {
         result = flb_log_event_encoder_set_body_from_msgpack_object(
-                    conn->ctx->log_encoder,
+                    ctx->log_encoder,
                     body);
     }
 
     if (result == FLB_EVENT_ENCODER_SUCCESS) {
-        result = flb_log_event_encoder_commit_record(conn->ctx->log_encoder);
+        result = flb_log_event_encoder_commit_record(ctx->log_encoder);
     }
 
     if (result == FLB_EVENT_ENCODER_SUCCESS) {
         flb_input_log_append(in, tag, tag_len,
-                             conn->ctx->log_encoder->output_buffer,
-                             conn->ctx->log_encoder->output_length);
+                             ctx->log_encoder->output_buffer,
+                             ctx->log_encoder->output_length);
     }
 
-    flb_log_event_encoder_reset(conn->ctx->log_encoder);
+    flb_log_event_encoder_reset(ctx->log_encoder);
+
+    /* Check if plugin was paused during log append (connection may have been deleted) */
+    pthread_mutex_lock(&ctx->conn_mutex);
+    if (ctx->is_paused) {
+        pthread_mutex_unlock(&ctx->conn_mutex);
+        return -1;
+    }
+    pthread_mutex_unlock(&ctx->conn_mutex);
 
     if (chunk_id != -1) {
         chunk = options.via.map.ptr[chunk_id].val;
@@ -1075,6 +1086,11 @@ static int fw_process_message_mode_entry(
 static size_t receiver_recv(struct fw_conn *conn, char *buf, size_t try_size) {
     size_t off;
     size_t actual_size;
+
+    /* Safety check: ensure connection is not being deleted and buffer exists */
+    if (conn->being_deleted || !conn->buf) {
+        return 0;
+    }
 
     off = conn->buf_len - conn->rest;
     actual_size = try_size;
@@ -1288,6 +1304,24 @@ int fw_prot_process(struct flb_input_instance *ins, struct fw_conn *conn)
     conn->rest = conn->buf_len;
 
     while (1) {
+        /* Check if connection is being deleted or plugin is paused */
+        if (conn->being_deleted) {
+            msgpack_unpacker_free(unp);
+            msgpack_unpacked_destroy(&result);
+            flb_sds_destroy(out_tag);
+            return 0;
+        }
+
+        pthread_mutex_lock(&ctx->conn_mutex);
+        if (ctx->is_paused) {
+            pthread_mutex_unlock(&ctx->conn_mutex);
+            msgpack_unpacker_free(unp);
+            msgpack_unpacked_destroy(&result);
+            flb_sds_destroy(out_tag);
+            return 0;
+        }
+        pthread_mutex_unlock(&ctx->conn_mutex);
+
         recv_len = receiver_to_unpacker(conn, EACH_RECV_SIZE, unp);
         if (recv_len == 0) {
             /* No more data */
@@ -1445,6 +1479,14 @@ int fw_prot_process(struct flb_input_instance *ins, struct fw_conn *conn)
                             out_tag, flb_sds_len(out_tag),
                             &entry.via.array.ptr[index],
                             chunk_id);
+
+                    /* Check if connection was deleted during processing */
+                    if (conn->being_deleted) {
+                        msgpack_unpacked_destroy(&result);
+                        msgpack_unpacker_free(unp);
+                        flb_sds_destroy(out_tag);
+                        return 0;
+                    }
                 }
 
                 if (chunk_id != -1) {
@@ -1493,11 +1535,37 @@ int fw_prot_process(struct flb_input_instance *ins, struct fw_conn *conn)
                 }
 
                 /* Process map */
-                fw_process_message_mode_entry(
+                ret = fw_process_message_mode_entry(
                     conn->in, conn,
                     out_tag, flb_sds_len(out_tag),
                     &root, &entry, &map, chunk_id,
                     metadata_id);
+
+                /* Check if plugin was paused (connection may have been deleted) */
+                if (ret == -1) {
+                    pthread_mutex_lock(&ctx->conn_mutex);
+                    if (ctx->is_paused) {
+                        pthread_mutex_unlock(&ctx->conn_mutex);
+                        msgpack_unpacked_destroy(&result);
+                        msgpack_unpacker_free(unp);
+                        flb_sds_destroy(out_tag);
+                        return 0;
+                    }
+                    if (conn->being_deleted) {
+                        pthread_mutex_unlock(&ctx->conn_mutex);
+                        msgpack_unpacked_destroy(&result);
+                        msgpack_unpacker_free(unp);
+                        flb_sds_destroy(out_tag);
+                        return 0;
+                    }
+                    pthread_mutex_unlock(&ctx->conn_mutex);
+
+                    /* For any other error case, clean up and return error */
+                    msgpack_unpacked_destroy(&result);
+                    msgpack_unpacker_free(unp);
+                    flb_sds_destroy(out_tag);
+                    return -1;
+                }
             }
             else if (entry.type == MSGPACK_OBJECT_STR ||
                      entry.type == MSGPACK_OBJECT_BIN) {
@@ -1617,6 +1685,17 @@ int fw_prot_process(struct flb_input_instance *ins, struct fw_conn *conn)
                                     flb_free(decomp_buf);
 
                                     goto cleanup_decompress;
+                                }
+
+                                /* Check if connection was deleted during append */
+                                if (conn->being_deleted) {
+                                    flb_free(decomp_buf);
+                                    msgpack_unpacked_destroy(&result);
+                                    msgpack_unpacker_free(unp);
+                                    flb_sds_destroy(out_tag);
+                                    flb_decompression_context_destroy(conn->d_ctx);
+                                    conn->d_ctx = NULL;
+                                    return 0;
                                 }
                             }
                         } while (decomp_len > 0);

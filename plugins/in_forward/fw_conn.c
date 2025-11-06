@@ -28,6 +28,66 @@
 #include "fw_prot.h"
 #include "fw_conn.h"
 
+/* Reference counting functions */
+static inline void fw_conn_get(struct fw_conn *conn)
+{
+    __atomic_add_fetch(&conn->refcount, 1, __ATOMIC_SEQ_CST);
+}
+
+static inline void fw_conn_put(struct fw_conn *conn);  /* Forward declaration */
+
+/* Actual cleanup when refcount reaches zero */
+static void fw_conn_free(struct fw_conn *conn)
+{
+    struct flb_in_fw_config *ctx = conn->ctx;
+
+    /* Remove from connections list if still there */
+    if (conn->_head.prev && conn->_head.next) {
+        pthread_mutex_lock(&ctx->conn_mutex);
+        mk_list_del(&conn->_head);
+        pthread_mutex_unlock(&ctx->conn_mutex);
+    }
+
+    /* Release the downstream connection */
+    if (conn->connection) {
+        flb_downstream_conn_release(conn->connection);
+        conn->connection = NULL;
+    }
+
+    /* Release decompression context if it exists */
+    if (conn->d_ctx) {
+        flb_decompression_context_destroy(conn->d_ctx);
+        conn->d_ctx = NULL;
+    }
+
+    if (conn->helo != NULL) {
+        if (conn->helo->nonce != NULL) {
+            flb_sds_destroy(conn->helo->nonce);
+        }
+        if (conn->helo->salt != NULL) {
+            flb_sds_destroy(conn->helo->salt);
+        }
+        flb_free(conn->helo);
+        conn->helo = NULL;
+    }
+
+    /* Free buffer */
+    if (conn->buf) {
+        flb_free(conn->buf);
+        conn->buf = NULL;
+    }
+
+    flb_free(conn);
+}
+
+/* Decrement reference count and free if it reaches zero */
+static inline void fw_conn_put(struct fw_conn *conn)
+{
+    if (__atomic_sub_fetch(&conn->refcount, 1, __ATOMIC_SEQ_CST) == 0) {
+        fw_conn_free(conn);
+    }
+}
+
 /* Callback invoked every time an event is triggered for a connection */
 int fw_conn_event(void *data)
 {
@@ -42,34 +102,28 @@ int fw_conn_event(void *data)
     struct flb_connection *connection;
 
     connection = (struct flb_connection *) data;
-
-    /* Get ctx from the connection's plugin_context to safely acquire mutex */
-    ctx = (struct flb_in_fw_config *) connection->plugin_context;
-
-    /* Bail out early if ctx is NULL (should not happen in normal operation) */
-    if (!ctx) {
-        return -1;
-    }
-
-    /*
-     * Acquire mutex BEFORE accessing connection->user_data to prevent race condition.
-     * We'll release it before any blocking operations to avoid deadlock.
-     */
-    pthread_mutex_lock(&ctx->conn_mutex);
-
-    /* Now safely check if connection is still valid after acquiring lock */
     conn = connection->user_data;
-    if (!conn || ctx->is_paused) {
-        pthread_mutex_unlock(&ctx->conn_mutex);
+
+    /* Check if connection is still valid */
+    if (!conn) {
         return -1;
     }
 
-    /*
-     * IMPORTANT: We now have a valid conn pointer. We'll keep using it but
-     * must unlock the mutex before any potentially blocking operations
-     * (like fw_prot_secure_forward_handshake, fw_prot_process, flb_io_net_read)
-     * to avoid deadlocks.
-     */
+    /* Get a reference to prevent deletion while we're using it */
+    fw_conn_get(conn);
+
+    /* Check if connection is marked for deletion or plugin is paused */
+    if (__atomic_load_n(&conn->deleted, __ATOMIC_SEQ_CST) == 1) {
+        fw_conn_put(conn);
+        return -1;
+    }
+
+    ctx = conn->ctx;
+
+    if (ctx->is_paused) {
+        fw_conn_put(conn);
+        return -1;
+    }
 
     event = &connection->event;
 
@@ -77,28 +131,18 @@ int fw_conn_event(void *data)
         if (conn->handshake_status == FW_HANDSHAKE_PINGPONG) {
             flb_plg_trace(ctx->ins, "handshake status = %d", conn->handshake_status);
 
-            /* Unlock mutex before potentially blocking handshake operation */
-            pthread_mutex_unlock(&ctx->conn_mutex);
-
             ret = fw_prot_secure_forward_handshake(ctx->ins, conn);
             if (ret == -1) {
                 flb_plg_trace(ctx->ins, "fd=%i closed connection", event->fd);
-                /* Re-acquire mutex to safely delete connection */
-                pthread_mutex_lock(&ctx->conn_mutex);
-                fw_conn_del(conn);
-                pthread_mutex_unlock(&ctx->conn_mutex);
+                /* Just mark as deleted and return - cleanup happens when refcount reaches 0 */
+                __atomic_store_n(&conn->deleted, 1, __ATOMIC_SEQ_CST);
+                conn->connection->user_data = NULL;
+                fw_conn_put(conn);
                 return -1;
             }
 
-            /* Re-acquire mutex to update handshake status */
-            pthread_mutex_lock(&ctx->conn_mutex);
-            /* Re-check connection is still valid */
-            if (connection->user_data == NULL) {
-                pthread_mutex_unlock(&ctx->conn_mutex);
-                return -1;
-            }
             conn->handshake_status = FW_HANDSHAKE_ESTABLISHED;
-            pthread_mutex_unlock(&ctx->conn_mutex);
+            fw_conn_put(conn);
             return 0;
         }
 
@@ -109,9 +153,10 @@ int fw_conn_event(void *data)
             if (conn->buf_size >= ctx->buffer_max_size) {
                 flb_plg_warn(ctx->ins, "fd=%i incoming data exceed limit (%lu bytes)",
                              event->fd, (ctx->buffer_max_size));
-                /* Keep mutex held for fw_conn_del */
-                fw_conn_del(conn);
-                pthread_mutex_unlock(&ctx->conn_mutex);
+                /* Just mark as deleted and return - cleanup happens when refcount reaches 0 */
+                __atomic_store_n(&conn->deleted, 1, __ATOMIC_SEQ_CST);
+                conn->connection->user_data = NULL;
+                fw_conn_put(conn);
                 return -1;
             }
             else if (conn->buf_size + ctx->buffer_chunk_size > ctx->buffer_max_size) {
@@ -125,7 +170,7 @@ int fw_conn_event(void *data)
             tmp = flb_realloc(conn->buf, size);
             if (!tmp) {
                 flb_errno();
-                pthread_mutex_unlock(&ctx->conn_mutex);
+                fw_conn_put(conn);
                 return -1;
             }
             flb_plg_trace(ctx->ins, "fd=%i buffer realloc %i -> %i",
@@ -135,9 +180,6 @@ int fw_conn_event(void *data)
             conn->buf_size = size;
             available = (conn->buf_size - conn->buf_len);
         }
-
-        /* Unlock mutex before I/O operation */
-        pthread_mutex_unlock(&ctx->conn_mutex);
 
         bytes = flb_io_net_read(connection,
                                 (void *) &conn->buf[conn->buf_len],
@@ -150,33 +192,35 @@ int fw_conn_event(void *data)
 
             ret = fw_prot_process(ctx->ins, conn);
             if (ret == -1) {
-                /* Re-acquire mutex to safely delete connection */
-                pthread_mutex_lock(&ctx->conn_mutex);
-                fw_conn_del(conn);
-                pthread_mutex_unlock(&ctx->conn_mutex);
+                /* Just mark as deleted and return - cleanup happens when refcount reaches 0 */
+                __atomic_store_n(&conn->deleted, 1, __ATOMIC_SEQ_CST);
+                conn->connection->user_data = NULL;
+                fw_conn_put(conn);
                 return -1;
             }
+            fw_conn_put(conn);
             return bytes;
         }
         else {
             flb_plg_trace(ctx->ins, "fd=%i closed connection", event->fd);
-            /* Re-acquire mutex to safely delete connection */
-            pthread_mutex_lock(&ctx->conn_mutex);
-            fw_conn_del(conn);
-            pthread_mutex_unlock(&ctx->conn_mutex);
+            /* Just mark as deleted and return - cleanup happens when refcount reaches 0 */
+            __atomic_store_n(&conn->deleted, 1, __ATOMIC_SEQ_CST);
+            conn->connection->user_data = NULL;
+            fw_conn_put(conn);
             return -1;
         }
     }
 
     if (event->mask & MK_EVENT_CLOSE) {
         flb_plg_trace(ctx->ins, "fd=%i hangup", event->fd);
-        /* Keep mutex held for fw_conn_del */
-        fw_conn_del(conn);
-        pthread_mutex_unlock(&ctx->conn_mutex);
+        /* Just mark as deleted and return - cleanup happens when refcount reaches 0 */
+        __atomic_store_n(&conn->deleted, 1, __ATOMIC_SEQ_CST);
+        conn->connection->user_data = NULL;
+        fw_conn_put(conn);
         return -1;
     }
 
-    pthread_mutex_unlock(&ctx->conn_mutex);
+    fw_conn_put(conn);
     return 0;
 }
 
@@ -190,9 +234,12 @@ struct fw_conn *fw_conn_add(struct flb_connection *connection, struct flb_in_fw_
     conn = flb_calloc(1, sizeof(struct fw_conn));
     if (!conn) {
         flb_errno();
-
         return NULL;
     }
+
+    /* Initialize reference count to 1 */
+    conn->refcount = 1;
+    conn->deleted = 0;
 
     conn->handshake_status = FW_HANDSHAKE_ESTABLISHED;
     /*
@@ -203,7 +250,6 @@ struct fw_conn *fw_conn_add(struct flb_connection *connection, struct flb_in_fw_
      *
      * This closes the gap where "users-only" previously skipped authentication entirely.
      */
-    conn->handshake_status = FW_HANDSHAKE_ESTABLISHED; /* default */
     if (ctx->shared_key != NULL ||
         ctx->empty_shared_key == FLB_TRUE ||
         mk_list_size(&ctx->users) > 0) {
@@ -219,7 +265,6 @@ struct fw_conn *fw_conn_add(struct flb_connection *connection, struct flb_in_fw_
         if (ret != 0) {
             flb_free(helo);
             flb_free(conn);
-
             return NULL;
         }
 
@@ -231,7 +276,6 @@ struct fw_conn *fw_conn_add(struct flb_connection *connection, struct flb_in_fw_
 
     /* Set data for the event-loop */
     connection->user_data     = conn;
-    connection->plugin_context = ctx;
     connection->event.type    = FLB_ENGINE_EV_CUSTOM;
     connection->event.handler = fw_conn_event;
 
@@ -273,53 +317,40 @@ struct fw_conn *fw_conn_add(struct flb_connection *connection, struct flb_in_fw_
         return NULL;
     }
 
+    /* Add to connections list with mutex protection */
+    pthread_mutex_lock(&ctx->conn_mutex);
     mk_list_add(&conn->_head, &ctx->connections);
+    pthread_mutex_unlock(&ctx->conn_mutex);
+
     return conn;
 }
 
 int fw_conn_del(struct fw_conn *conn)
 {
+    struct flb_in_fw_config *ctx = conn->ctx;
+
+    /* Mark as deleted to prevent new operations */
+    __atomic_store_n(&conn->deleted, 1, __ATOMIC_SEQ_CST);
+
     /*
-     * IMPORTANT: This function must be called with ctx->conn_mutex held
-     * because it modifies the ctx->connections list.
-     *
-     * NULL the user_data pointer to prevent any in-flight event handlers
-     * from accessing this connection after it's freed
+     * NULL the user_data pointer to prevent any new event handlers
+     * from accessing this connection
      */
     conn->connection->user_data = NULL;
 
-    /* Remove from connections list while mutex is held */
+    /* Remove from connections list with mutex protection */
+    pthread_mutex_lock(&ctx->conn_mutex);
     mk_list_del(&conn->_head);
+    pthread_mutex_unlock(&ctx->conn_mutex);
 
-    /* The downstream unregisters the file descriptor from the event-loop
-     * so there's nothing to be done by the plugin
+    /*
+     * Don't call flb_downstream_conn_release() here - it will be called
+     * when the reference count reaches 0 in fw_conn_free().
+     * This avoids deadlocks when fw_conn_del() is called from the event handler.
      */
-    flb_downstream_conn_release(conn->connection);
 
-    /* Release decompression context if it exists */
-    if (conn->d_ctx) {
-        flb_decompression_context_destroy(conn->d_ctx);
-        conn->d_ctx = NULL;
-    }
-
-    if (conn->helo != NULL) {
-        if (conn->helo->nonce != NULL) {
-            flb_sds_destroy(conn->helo->nonce);
-        }
-        if (conn->helo->salt != NULL) {
-            flb_sds_destroy(conn->helo->salt);
-        }
-        flb_free(conn->helo);
-        conn->helo = NULL;
-    }
-
-    /* Free buffer and set to NULL to prevent use-after-free */
-    if (conn->buf) {
-        flb_free(conn->buf);
-        conn->buf = NULL;
-    }
-
-    flb_free(conn);
+    /* Release the initial reference - actual free happens when refcount reaches 0 */
+    fw_conn_put(conn);
 
     return 0;
 }
@@ -329,10 +360,38 @@ int fw_conn_del_all(struct flb_in_fw_config *ctx)
     struct mk_list *tmp;
     struct mk_list *head;
     struct fw_conn *conn;
+    struct mk_list conn_list;
 
+    /* Create a temporary list to hold connections */
+    mk_list_init(&conn_list);
+
+    /* Move all connections to temporary list under mutex */
+    pthread_mutex_lock(&ctx->conn_mutex);
     mk_list_foreach_safe(head, tmp, &ctx->connections) {
         conn = mk_list_entry(head, struct fw_conn, _head);
-        fw_conn_del(conn);
+
+        /* Mark as deleted */
+        __atomic_store_n(&conn->deleted, 1, __ATOMIC_SEQ_CST);
+
+        /* NULL the user_data pointer to prevent new events */
+        conn->connection->user_data = NULL;
+
+        /* Move from main list to temp list */
+        mk_list_del(&conn->_head);
+        mk_list_add(&conn->_head, &conn_list);
+    }
+    pthread_mutex_unlock(&ctx->conn_mutex);
+
+    /*
+     * Now release references from temp list. The actual cleanup including
+     * flb_downstream_conn_release() will happen in fw_conn_free()
+     * when the reference count reaches 0. This avoids any potential
+     * deadlock issues.
+     */
+    mk_list_foreach_safe(head, tmp, &conn_list) {
+        conn = mk_list_entry(head, struct fw_conn, _head);
+        mk_list_del(&conn->_head);
+        fw_conn_put(conn);
     }
 
     return 0;

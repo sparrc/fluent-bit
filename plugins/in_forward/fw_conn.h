@@ -44,6 +44,10 @@ struct fw_conn {
     int status;                      /* Connection status                 */
     int handshake_status;            /* handshake status                 */
 
+    /* Reference counting for safe deletion */
+    int refcount;                    /* Reference count (atomic)          */
+    int deleted;                     /* Marked for deletion (atomic)     */
+
     /* Buffer */
     char *buf;                       /* Buffer data                       */
     int  buf_len;                    /* Data length                       */

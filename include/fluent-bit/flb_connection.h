@@ -153,9 +153,6 @@ struct flb_connection {
 
     /* Each TCP connections using TLS needs a session */
     struct flb_tls_session *tls_session;
-
-    /* Plugin context pointer for safe mutex access */
-    void *plugin_context;
 };
 
 int flb_connection_setup(struct flb_connection *connection,

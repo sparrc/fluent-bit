@@ -1298,8 +1298,9 @@ int fw_prot_process(struct flb_input_instance *ins, struct fw_conn *conn)
     while (1) {
         /*
          * Check if plugin is paused.
-         * Note: We're called from fw_conn_event which already holds conn_mutex,
-         * so we can safely check ctx->is_paused without locking.
+         * With reference counting, the connection is protected from being freed
+         * while we're using it. The is_paused check may see a slightly stale value
+         * but that's acceptable - worst case we process one more message.
          */
         if (ctx->is_paused) {
             msgpack_unpacker_free(unp);

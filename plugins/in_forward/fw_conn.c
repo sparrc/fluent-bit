@@ -61,14 +61,14 @@ int fw_conn_event(void *data)
             ret = fw_prot_secure_forward_handshake(ctx->ins, conn);
             if (ret == -1) {
                 flb_plg_trace(ctx->ins, "fd=%i closed connection", event->fd);
-                fw_conn_del(conn);
+                fw_conn_del(conn, 1);
                 return -1;
             }
 
             conn->handshake_status = FW_HANDSHAKE_ESTABLISHED;
 
             /* Release event handler's reference */
-            fw_conn_del(conn);
+            fw_conn_del(conn, 0);
             return 0;
         }
 
@@ -79,7 +79,7 @@ int fw_conn_event(void *data)
             if (conn->buf_size >= ctx->buffer_max_size) {
                 flb_plg_warn(ctx->ins, "fd=%i incoming data exceed limit (%lu bytes)",
                              event->fd, (ctx->buffer_max_size));
-                fw_conn_del(conn);
+                fw_conn_del(conn, 1);
                 return -1;
             }
             else if (conn->buf_size + ctx->buffer_chunk_size > ctx->buffer_max_size) {
@@ -93,7 +93,7 @@ int fw_conn_event(void *data)
             tmp = flb_realloc(conn->buf, size);
             if (!tmp) {
                 flb_errno();
-                fw_conn_del(conn);
+                fw_conn_del(conn, 1);
                 return -1;
             }
             flb_plg_trace(ctx->ins, "fd=%i buffer realloc %i -> %i",
@@ -116,29 +116,29 @@ int fw_conn_event(void *data)
             ret = fw_prot_process(ctx->ins, conn);
 
             if (ret == -1) {
-                fw_conn_del(conn);
+                fw_conn_del(conn, 1);
                 return -1;
             }
 
             /* Release event handler's reference */
-            fw_conn_del(conn);
+            fw_conn_del(conn, 0);
             return bytes;
         }
         else {
             flb_plg_trace(ctx->ins, "fd=%i closed connection", event->fd);
-            fw_conn_del(conn);
+            fw_conn_del(conn, 1);
             return -1;
         }
     }
 
     if (event->mask & MK_EVENT_CLOSE) {
         flb_plg_trace(ctx->ins, "fd=%i hangup", event->fd);
-        fw_conn_del(conn);
+        fw_conn_del(conn, 1);
         return -1;
     }
 
     /* Release event handler's reference */
-    fw_conn_del(conn);
+    fw_conn_del(conn, 0);
     return 0;
 }
 
@@ -251,14 +251,24 @@ struct fw_conn *fw_conn_add(struct flb_connection *connection, struct flb_in_fw_
     return conn;
 }
 
-int fw_conn_del(struct fw_conn *conn)
+int fw_conn_del(struct fw_conn *conn, int force)
 {
     int should_free;
 
     /* Decrement reference count and check if we should free */
     pthread_mutex_lock(&conn->refcount_mutex);
-    conn->refcount--;
-    should_free = (conn->refcount == 0);
+
+    if (force) {
+        /* Force full cleanup - connection is terminally broken */
+        conn->refcount = 0;
+        should_free = 1;
+    }
+    else {
+        /* Normal reference release */
+        conn->refcount--;
+        should_free = (conn->refcount == 0);
+    }
+
     pthread_mutex_unlock(&conn->refcount_mutex);
 
     if (!should_free) {
@@ -308,7 +318,7 @@ int fw_conn_del_all(struct flb_in_fw_config *ctx)
 
     mk_list_foreach_safe(head, tmp, &ctx->connections) {
         conn = mk_list_entry(head, struct fw_conn, _head);
-        fw_conn_del(conn);
+        fw_conn_del(conn, 0);
     }
 
     return 0;

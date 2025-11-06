@@ -1067,14 +1067,6 @@ static int fw_process_message_mode_entry(
 
     flb_log_event_encoder_reset(ctx->log_encoder);
 
-    /* Check if plugin was paused during log append (connection may have been deleted) */
-    pthread_mutex_lock(&ctx->conn_mutex);
-    if (ctx->is_paused) {
-        pthread_mutex_unlock(&ctx->conn_mutex);
-        return -1;
-    }
-    pthread_mutex_unlock(&ctx->conn_mutex);
-
     if (chunk_id != -1) {
         chunk = options.via.map.ptr[chunk_id].val;
         send_ack(in, conn, chunk);
@@ -1087,8 +1079,8 @@ static size_t receiver_recv(struct fw_conn *conn, char *buf, size_t try_size) {
     size_t off;
     size_t actual_size;
 
-    /* Safety check: ensure connection is not being deleted and buffer exists */
-    if (conn->being_deleted || !conn->buf) {
+    /* Safety check: ensure buffer exists */
+    if (!conn->buf) {
         return 0;
     }
 
@@ -1304,23 +1296,17 @@ int fw_prot_process(struct flb_input_instance *ins, struct fw_conn *conn)
     conn->rest = conn->buf_len;
 
     while (1) {
-        /* Check if connection is being deleted or plugin is paused */
-        if (conn->being_deleted) {
-            msgpack_unpacker_free(unp);
-            msgpack_unpacked_destroy(&result);
-            flb_sds_destroy(out_tag);
-            return 0;
-        }
-
-        pthread_mutex_lock(&ctx->conn_mutex);
+        /*
+         * Check if plugin is paused.
+         * Note: We're called from fw_conn_event which already holds conn_mutex,
+         * so we can safely check ctx->is_paused without locking.
+         */
         if (ctx->is_paused) {
-            pthread_mutex_unlock(&ctx->conn_mutex);
             msgpack_unpacker_free(unp);
             msgpack_unpacked_destroy(&result);
             flb_sds_destroy(out_tag);
             return 0;
         }
-        pthread_mutex_unlock(&ctx->conn_mutex);
 
         recv_len = receiver_to_unpacker(conn, EACH_RECV_SIZE, unp);
         if (recv_len == 0) {
@@ -1479,14 +1465,6 @@ int fw_prot_process(struct flb_input_instance *ins, struct fw_conn *conn)
                             out_tag, flb_sds_len(out_tag),
                             &entry.via.array.ptr[index],
                             chunk_id);
-
-                    /* Check if connection was deleted during processing */
-                    if (conn->being_deleted) {
-                        msgpack_unpacked_destroy(&result);
-                        msgpack_unpacker_free(unp);
-                        flb_sds_destroy(out_tag);
-                        return 0;
-                    }
                 }
 
                 if (chunk_id != -1) {
@@ -1543,22 +1521,12 @@ int fw_prot_process(struct flb_input_instance *ins, struct fw_conn *conn)
 
                 /* Check if plugin was paused (connection may have been deleted) */
                 if (ret == -1) {
-                    pthread_mutex_lock(&ctx->conn_mutex);
                     if (ctx->is_paused) {
-                        pthread_mutex_unlock(&ctx->conn_mutex);
                         msgpack_unpacked_destroy(&result);
                         msgpack_unpacker_free(unp);
                         flb_sds_destroy(out_tag);
                         return 0;
                     }
-                    if (conn->being_deleted) {
-                        pthread_mutex_unlock(&ctx->conn_mutex);
-                        msgpack_unpacked_destroy(&result);
-                        msgpack_unpacker_free(unp);
-                        flb_sds_destroy(out_tag);
-                        return 0;
-                    }
-                    pthread_mutex_unlock(&ctx->conn_mutex);
 
                     /* For any other error case, clean up and return error */
                     msgpack_unpacked_destroy(&result);
@@ -1685,17 +1653,6 @@ int fw_prot_process(struct flb_input_instance *ins, struct fw_conn *conn)
                                     flb_free(decomp_buf);
 
                                     goto cleanup_decompress;
-                                }
-
-                                /* Check if connection was deleted during append */
-                                if (conn->being_deleted) {
-                                    flb_free(decomp_buf);
-                                    msgpack_unpacked_destroy(&result);
-                                    msgpack_unpacker_free(unp);
-                                    flb_sds_destroy(out_tag);
-                                    flb_decompression_context_destroy(conn->d_ctx);
-                                    conn->d_ctx = NULL;
-                                    return 0;
                                 }
                             }
                         } while (decomp_len > 0);

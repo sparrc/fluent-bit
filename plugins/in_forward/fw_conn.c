@@ -43,27 +43,33 @@ int fw_conn_event(void *data)
 
     connection = (struct flb_connection *) data;
 
-    conn = connection->user_data;
+    /* Get ctx from the connection's plugin_context to safely acquire mutex */
+    ctx = (struct flb_in_fw_config *) connection->plugin_context;
 
-    /* Check if connection is still valid */
-    if (!conn) {
+    /* Bail out early if ctx is NULL (should not happen in normal operation) */
+    if (!ctx) {
         return -1;
     }
 
-    ctx = conn->ctx;
-
     /*
-     * Acquire mutex to check if plugin is paused.
-     * If paused, the connection may have been deleted, so exit early.
+     * Acquire mutex BEFORE accessing connection->user_data to prevent race condition.
+     * We'll release it before any blocking operations to avoid deadlock.
      */
     pthread_mutex_lock(&ctx->conn_mutex);
 
-    if (ctx->is_paused) {
+    /* Now safely check if connection is still valid after acquiring lock */
+    conn = connection->user_data;
+    if (!conn || ctx->is_paused) {
         pthread_mutex_unlock(&ctx->conn_mutex);
         return -1;
     }
 
-    pthread_mutex_unlock(&ctx->conn_mutex);
+    /*
+     * IMPORTANT: We now have a valid conn pointer. We'll keep using it but
+     * must unlock the mutex before any potentially blocking operations
+     * (like fw_prot_secure_forward_handshake, fw_prot_process, flb_io_net_read)
+     * to avoid deadlocks.
+     */
 
     event = &connection->event;
 
@@ -71,15 +77,28 @@ int fw_conn_event(void *data)
         if (conn->handshake_status == FW_HANDSHAKE_PINGPONG) {
             flb_plg_trace(ctx->ins, "handshake status = %d", conn->handshake_status);
 
+            /* Unlock mutex before potentially blocking handshake operation */
+            pthread_mutex_unlock(&ctx->conn_mutex);
+
             ret = fw_prot_secure_forward_handshake(ctx->ins, conn);
             if (ret == -1) {
                 flb_plg_trace(ctx->ins, "fd=%i closed connection", event->fd);
+                /* Re-acquire mutex to safely delete connection */
+                pthread_mutex_lock(&ctx->conn_mutex);
                 fw_conn_del(conn);
-
+                pthread_mutex_unlock(&ctx->conn_mutex);
                 return -1;
             }
 
+            /* Re-acquire mutex to update handshake status */
+            pthread_mutex_lock(&ctx->conn_mutex);
+            /* Re-check connection is still valid */
+            if (connection->user_data == NULL) {
+                pthread_mutex_unlock(&ctx->conn_mutex);
+                return -1;
+            }
             conn->handshake_status = FW_HANDSHAKE_ESTABLISHED;
+            pthread_mutex_unlock(&ctx->conn_mutex);
             return 0;
         }
 
@@ -90,7 +109,9 @@ int fw_conn_event(void *data)
             if (conn->buf_size >= ctx->buffer_max_size) {
                 flb_plg_warn(ctx->ins, "fd=%i incoming data exceed limit (%lu bytes)",
                              event->fd, (ctx->buffer_max_size));
+                /* Keep mutex held for fw_conn_del */
                 fw_conn_del(conn);
+                pthread_mutex_unlock(&ctx->conn_mutex);
                 return -1;
             }
             else if (conn->buf_size + ctx->buffer_chunk_size > ctx->buffer_max_size) {
@@ -104,6 +125,7 @@ int fw_conn_event(void *data)
             tmp = flb_realloc(conn->buf, size);
             if (!tmp) {
                 flb_errno();
+                pthread_mutex_unlock(&ctx->conn_mutex);
                 return -1;
             }
             flb_plg_trace(ctx->ins, "fd=%i buffer realloc %i -> %i",
@@ -113,6 +135,9 @@ int fw_conn_event(void *data)
             conn->buf_size = size;
             available = (conn->buf_size - conn->buf_len);
         }
+
+        /* Unlock mutex before I/O operation */
+        pthread_mutex_unlock(&ctx->conn_mutex);
 
         bytes = flb_io_net_read(connection,
                                 (void *) &conn->buf[conn->buf_len],
@@ -125,23 +150,33 @@ int fw_conn_event(void *data)
 
             ret = fw_prot_process(ctx->ins, conn);
             if (ret == -1) {
+                /* Re-acquire mutex to safely delete connection */
+                pthread_mutex_lock(&ctx->conn_mutex);
                 fw_conn_del(conn);
+                pthread_mutex_unlock(&ctx->conn_mutex);
                 return -1;
             }
             return bytes;
         }
         else {
             flb_plg_trace(ctx->ins, "fd=%i closed connection", event->fd);
+            /* Re-acquire mutex to safely delete connection */
+            pthread_mutex_lock(&ctx->conn_mutex);
             fw_conn_del(conn);
+            pthread_mutex_unlock(&ctx->conn_mutex);
             return -1;
         }
     }
 
     if (event->mask & MK_EVENT_CLOSE) {
         flb_plg_trace(ctx->ins, "fd=%i hangup", event->fd);
+        /* Keep mutex held for fw_conn_del */
         fw_conn_del(conn);
+        pthread_mutex_unlock(&ctx->conn_mutex);
         return -1;
     }
+
+    pthread_mutex_unlock(&ctx->conn_mutex);
     return 0;
 }
 
@@ -159,7 +194,6 @@ struct fw_conn *fw_conn_add(struct flb_connection *connection, struct flb_in_fw_
         return NULL;
     }
 
-    conn->being_deleted = 0;
     conn->handshake_status = FW_HANDSHAKE_ESTABLISHED;
     /*
      * Always force the secure-forward handshake when:
@@ -197,6 +231,7 @@ struct fw_conn *fw_conn_add(struct flb_connection *connection, struct flb_in_fw_
 
     /* Set data for the event-loop */
     connection->user_data     = conn;
+    connection->plugin_context = ctx;
     connection->event.type    = FLB_ENGINE_EV_CUSTOM;
     connection->event.handler = fw_conn_event;
 
@@ -245,18 +280,21 @@ struct fw_conn *fw_conn_add(struct flb_connection *connection, struct flb_in_fw_
 int fw_conn_del(struct fw_conn *conn)
 {
     /*
-     * Set being_deleted flag to prevent any in-flight processing
-     * from accessing this connection's resources
+     * IMPORTANT: This function must be called with ctx->conn_mutex held
+     * because it modifies the ctx->connections list.
+     *
+     * NULL the user_data pointer to prevent any in-flight event handlers
+     * from accessing this connection after it's freed
      */
-    conn->being_deleted = 1;
+    conn->connection->user_data = NULL;
+
+    /* Remove from connections list while mutex is held */
+    mk_list_del(&conn->_head);
 
     /* The downstream unregisters the file descriptor from the event-loop
      * so there's nothing to be done by the plugin
      */
     flb_downstream_conn_release(conn->connection);
-
-    /* Release resources */
-    mk_list_del(&conn->_head);
 
     /* Release decompression context if it exists */
     if (conn->d_ctx) {

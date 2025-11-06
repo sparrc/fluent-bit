@@ -146,13 +146,16 @@ struct flb_connection {
     /*
      * Link to list head on the stream, if the connection is busy,
      * it's linked to 'busy_queue', otherwise it resides in 'av_queue'
-     * for upstream connections so it can be used by a plugin or 
+     * for upstream connections so it can be used by a plugin or
      * 'destroy_queue' awaiting release.
-     */    
+     */
     struct mk_list _head;
 
     /* Each TCP connections using TLS needs a session */
     struct flb_tls_session *tls_session;
+
+    /* Plugin context pointer for safe mutex access */
+    void *plugin_context;
 };
 
 int flb_connection_setup(struct flb_connection *connection,

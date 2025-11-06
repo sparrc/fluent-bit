@@ -20,6 +20,7 @@
 #ifndef FLB_IN_FW_CONN_H
 #define FLB_IN_FW_CONN_H
 
+#include <fluent-bit/flb_pthread.h>
 #include <fluent-bit/flb_compression.h>
 
 #define FLB_IN_FW_CHUNK_SIZE      "1024000" /* 1MB */
@@ -41,6 +42,8 @@ struct flb_in_fw_helo;
 
 /* Respresents a connection */
 struct fw_conn {
+    int refcount;                    /* Reference counter for safe deletion */
+    pthread_mutex_t refcount_mutex;  /* Mutex protecting refcount */
     int status;                      /* Connection status                 */
     int handshake_status;            /* handshake status                 */
 

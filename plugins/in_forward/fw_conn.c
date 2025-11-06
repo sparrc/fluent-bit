@@ -45,6 +45,11 @@ int fw_conn_event(void *data)
 
     conn = connection->user_data;
 
+    /* Increment reference count while we're processing this connection */
+    pthread_mutex_lock(&conn->refcount_mutex);
+    conn->refcount++;
+    pthread_mutex_unlock(&conn->refcount_mutex);
+
     ctx = conn->ctx;
 
     event = &connection->event;
@@ -55,13 +60,29 @@ int fw_conn_event(void *data)
 
             ret = fw_prot_secure_forward_handshake(ctx->ins, conn);
             if (ret == -1) {
-                flb_plg_trace(ctx->ins, "fd=%i closed connection", event->fd);
-                fw_conn_del(conn);
+                int old_refcount;
 
+                flb_plg_trace(ctx->ins, "fd=%i closed connection", event->fd);
+
+                /* Decrement reference count and check if we should free */
+                pthread_mutex_lock(&conn->refcount_mutex);
+                old_refcount = conn->refcount;
+                conn->refcount--;
+                pthread_mutex_unlock(&conn->refcount_mutex);
+
+                /* Only call fw_conn_del if we were the last reference */
+                if (old_refcount == 1) {
+                    fw_conn_del(conn);
+                }
                 return -1;
             }
 
             conn->handshake_status = FW_HANDSHAKE_ESTABLISHED;
+
+            /* Decrement reference count before returning */
+            pthread_mutex_lock(&conn->refcount_mutex);
+            conn->refcount--;
+            pthread_mutex_unlock(&conn->refcount_mutex);
             return 0;
         }
 
@@ -70,9 +91,21 @@ int fw_conn_event(void *data)
         available = (conn->buf_size - conn->buf_len);
         if (available < 1) {
             if (conn->buf_size >= ctx->buffer_max_size) {
+                int old_refcount;
+
                 flb_plg_warn(ctx->ins, "fd=%i incoming data exceed limit (%lu bytes)",
                              event->fd, (ctx->buffer_max_size));
-                fw_conn_del(conn);
+
+                /* Decrement reference count and check if we should free */
+                pthread_mutex_lock(&conn->refcount_mutex);
+                old_refcount = conn->refcount;
+                conn->refcount--;
+                pthread_mutex_unlock(&conn->refcount_mutex);
+
+                /* Only call fw_conn_del if we were the last reference */
+                if (old_refcount == 1) {
+                    fw_conn_del(conn);
+                }
                 return -1;
             }
             else if (conn->buf_size + ctx->buffer_chunk_size > ctx->buffer_max_size) {
@@ -86,6 +119,11 @@ int fw_conn_event(void *data)
             tmp = flb_realloc(conn->buf, size);
             if (!tmp) {
                 flb_errno();
+
+                /* Decrement reference count before returning */
+                pthread_mutex_lock(&conn->refcount_mutex);
+                conn->refcount--;
+                pthread_mutex_unlock(&conn->refcount_mutex);
                 return -1;
             }
             flb_plg_trace(ctx->ins, "fd=%i buffer realloc %i -> %i",
@@ -106,24 +144,68 @@ int fw_conn_event(void *data)
             conn->buf_len += bytes;
 
             ret = fw_prot_process(ctx->ins, conn);
+
+            /* Decrement reference count and check if we should free */
+            pthread_mutex_lock(&conn->refcount_mutex);
+            int old_refcount = conn->refcount;
+            conn->refcount--;
+            pthread_mutex_unlock(&conn->refcount_mutex);
+
             if (ret == -1) {
-                fw_conn_del(conn);
+                /* Only call fw_conn_del if we were the last reference */
+                if (old_refcount == 1) {
+                    fw_conn_del(conn);
+                }
                 return -1;
+            }
+
+            /* Always try to delete in case it was marked for deletion during processing */
+            if (old_refcount == 1) {
+                fw_conn_del(conn);
             }
             return bytes;
         }
         else {
+            int old_refcount;
+
             flb_plg_trace(ctx->ins, "fd=%i closed connection", event->fd);
-            fw_conn_del(conn);
+
+            /* Decrement reference count and check if we should free */
+            pthread_mutex_lock(&conn->refcount_mutex);
+            old_refcount = conn->refcount;
+            conn->refcount--;
+            pthread_mutex_unlock(&conn->refcount_mutex);
+
+            /* Only call fw_conn_del if we were the last reference */
+            if (old_refcount == 1) {
+                fw_conn_del(conn);
+            }
             return -1;
         }
     }
 
     if (event->mask & MK_EVENT_CLOSE) {
+        int old_refcount;
+
         flb_plg_trace(ctx->ins, "fd=%i hangup", event->fd);
-        fw_conn_del(conn);
+
+        /* Decrement reference count and check if we should free */
+        pthread_mutex_lock(&conn->refcount_mutex);
+        old_refcount = conn->refcount;
+        conn->refcount--;
+        pthread_mutex_unlock(&conn->refcount_mutex);
+
+        /* Only call fw_conn_del if we were the last reference */
+        if (old_refcount == 1) {
+            fw_conn_del(conn);
+        }
         return -1;
     }
+
+    /* Decrement reference count before returning */
+    pthread_mutex_lock(&conn->refcount_mutex);
+    conn->refcount--;
+    pthread_mutex_unlock(&conn->refcount_mutex);
     return 0;
 }
 
@@ -203,6 +285,19 @@ struct fw_conn *fw_conn_add(struct flb_connection *connection, struct flb_in_fw_
     conn->compression_type = FLB_COMPRESSION_ALGORITHM_NONE;
     conn->d_ctx = NULL;
 
+    /* Initialize reference count to 1 (the caller holds the first reference) */
+    conn->refcount = 1;
+    ret = pthread_mutex_init(&conn->refcount_mutex, NULL);
+    if (ret != 0) {
+        flb_errno();
+        if (conn->helo != NULL) {
+            flb_free(conn->helo);
+        }
+        flb_free(conn->buf);
+        flb_free(conn);
+        return NULL;
+    }
+
     /* Register instance into the event loop */
     ret = mk_event_add(flb_engine_evl_get(),
                        connection->fd,
@@ -225,6 +320,20 @@ struct fw_conn *fw_conn_add(struct flb_connection *connection, struct flb_in_fw_
 
 int fw_conn_del(struct fw_conn *conn)
 {
+    int current_refcount;
+
+    /* Check current reference count without modifying it */
+    pthread_mutex_lock(&conn->refcount_mutex);
+    current_refcount = conn->refcount;
+    pthread_mutex_unlock(&conn->refcount_mutex);
+
+    if (current_refcount > 1) {
+        /* Someone is actively using this connection, don't free yet */
+        return 0;
+    }
+
+    /* Safe to free - refcount is 1 (only initial reference, no active users) */
+
     /* The downstream unregisters the file descriptor from the event-loop
      * so there's nothing to be done by the plugin
      */
@@ -247,6 +356,10 @@ int fw_conn_del(struct fw_conn *conn)
         }
         flb_free(conn->helo);
     }
+
+    /* Destroy the mutex before freeing the connection */
+    pthread_mutex_destroy(&conn->refcount_mutex);
+
     flb_free(conn->buf);
     flb_free(conn);
 

@@ -59,6 +59,25 @@
 
 #define AMZN_REQUEST_ID_HEADER          "x-amzn-RequestId"
 
+/* Helper function to extract AWS request ID from response headers */
+static flb_sds_t get_aws_request_id(struct flb_http_client *c)
+{
+    flb_sds_t header;
+
+    if (!c || !c->resp.data) {
+        return NULL;
+    }
+
+    header = flb_http_get_header(c, AMZN_REQUEST_ID_HEADER,
+                                  strlen(AMZN_REQUEST_ID_HEADER));
+    if (header) {
+        /* flb_http_get_header returns a new sds string, so we can return it directly */
+        return header;
+    }
+
+    return NULL;
+}
+
 #define ONE_DAY_IN_MILLISECONDS          86400000
 #define FOUR_HOURS_IN_SECONDS            14400
 
@@ -1125,7 +1144,7 @@ static void set_entity_field(char **field, struct flb_ra_value *val,
     if (!val || val->type != FLB_RA_STRING) {
         return;
     }
-    
+
     if (found_flag && !*found_flag) {
         if (filter_count) {
             (*filter_count)++;
@@ -1135,11 +1154,11 @@ static void set_entity_field(char **field, struct flb_ra_value *val,
     else if (!found_flag && *field == NULL && filter_count) {
         (*filter_count)++;
     }
-    
+
     if (*field) {
         flb_free(*field);
     }
-    
+
     if (val->storage == FLB_RA_REF) {
         *field = flb_strndup(val->val.ref.buf, val->val.ref.len);
     }
@@ -1182,23 +1201,23 @@ void parse_entity(struct flb_cloudwatch *ctx, entity *entity,
          &entity->root_filter_count, NULL},
         {NULL, NULL, NULL, NULL}
     };
-    
+
     for (i = 0; field_map[i].path; i++) {
         ra = flb_ra_create(field_map[i].path, FLB_FALSE);
         if (!ra) {
             continue;
         }
-        
+
         val = flb_ra_get_value_object(ra, map);
         if (val) {
             set_entity_field(field_map[i].field, val, field_map[i].filter_count,
                            field_map[i].found_flag);
             flb_ra_key_value_destroy(val);
         }
-        
+
         flb_ra_destroy(ra);
     }
-    
+
     if (entity->key_attributes->name == NULL &&
         entity->attributes->name_source == NULL &&
         entity->attributes->workload != NULL) {
@@ -1206,7 +1225,7 @@ void parse_entity(struct flb_cloudwatch *ctx, entity *entity,
                                                  strlen(entity->attributes->workload));
         entity->attributes->name_source = flb_strndup("K8sWorkload", 11);
     }
-    
+
     if (entity->key_attributes->environment == NULL) {
         entity->key_attributes->environment = find_fallback_environment(ctx, entity);
     }
@@ -1752,30 +1771,43 @@ static int set_log_group_retention(struct flb_cloudwatch *ctx, struct log_stream
     }
 
     if (c) {
+        flb_sds_t request_id = get_aws_request_id(c);
+
         flb_plg_debug(ctx->ins, "PutRetentionPolicy http status=%d", c->resp.status);
 
         if (c->resp.status == 200) {
             /* success */
             flb_plg_info(ctx->ins, "Set retention policy to %d", ctx->log_retention_days);
+            flb_sds_destroy(request_id);
             flb_sds_destroy(body);
             flb_http_client_destroy(c);
             return 0;
         }
 
         /* Check error */
+        if (request_id) {
+            flb_plg_error(ctx->ins, "PutRetentionPolicy failed: HTTP status=%d, request_id=%s",
+                         c->resp.status, request_id);
+        }
+        else {
+            flb_plg_error(ctx->ins, "PutRetentionPolicy failed: HTTP status=%d",
+                         c->resp.status);
+        }
+
         if (c->resp.payload_size > 0) {
             /* some error occurred; notify user */
             flb_aws_print_error(c->resp.payload, c->resp.payload_size,
                                                "PutRetentionPolicy", ctx->ins);
         }
-    }
 
-    flb_plg_error(ctx->ins, "Failed to putRetentionPolicy");
-    if (c) {
+        flb_sds_destroy(request_id);
         flb_http_client_destroy(c);
+        flb_sds_destroy(body);
+        return -1;
     }
-    flb_sds_destroy(body);
 
+    flb_plg_error(ctx->ins, "Failed to putRetentionPolicy: connection error");
+    flb_sds_destroy(body);
     return -1;
 }
 
@@ -1835,12 +1867,15 @@ int create_log_group(struct flb_cloudwatch *ctx, struct log_stream *stream)
     }
 
     if (c) {
+        flb_sds_t request_id = get_aws_request_id(c);
+
         flb_plg_debug(ctx->ins, "CreateLogGroup http status=%d", c->resp.status);
 
         if (c->resp.status == 200) {
             /* success */
             flb_plg_info(ctx->ins, "Created log group %s with storage class %s",
                          stream->group, ctx->log_group_class);
+            flb_sds_destroy(request_id);
             flb_sds_destroy(body);
             flb_http_client_destroy(c);
             ret = set_log_group_retention(ctx, stream);
@@ -1862,6 +1897,7 @@ int create_log_group(struct flb_cloudwatch *ctx, struct log_stream *stream)
                         flb_plg_info(ctx->ins, "Log Group %s already exists",
                                      stream->group);
                     }
+                    flb_sds_destroy(request_id);
                     flb_sds_destroy(body);
                     flb_sds_destroy(error);
                     flb_http_client_destroy(c);
@@ -1869,21 +1905,40 @@ int create_log_group(struct flb_cloudwatch *ctx, struct log_stream *stream)
                     return ret;
                 }
                 /* some other error occurred; notify user */
+                if (request_id) {
+                    flb_plg_error(ctx->ins, "CreateLogGroup failed: HTTP status=%d, request_id=%s",
+                                 c->resp.status, request_id);
+                }
+                else {
+                    flb_plg_error(ctx->ins, "CreateLogGroup failed: HTTP status=%d",
+                                 c->resp.status);
+                }
                 flb_aws_print_error(c->resp.payload, c->resp.payload_size,
                                     "CreateLogGroup", ctx->ins);
                 flb_sds_destroy(error);
             }
             else {
                 /* error can not be parsed, print raw response */
-                flb_plg_warn(ctx->ins, "Raw response: %s", c->resp.payload);
+                if (request_id) {
+                    flb_plg_error(ctx->ins, "CreateLogGroup failed: HTTP status=%d, request_id=%s",
+                                 c->resp.status, request_id);
+                    flb_plg_warn(ctx->ins, "Raw response: %s", c->resp.payload);
+                }
+                else {
+                    flb_plg_error(ctx->ins, "CreateLogGroup failed: HTTP status=%d",
+                                 c->resp.status);
+                    flb_plg_warn(ctx->ins, "Raw response: %s", c->resp.payload);
+                }
             }
         }
+
+        flb_sds_destroy(request_id);
+        flb_http_client_destroy(c);
+        flb_sds_destroy(body);
+        return -1;
     }
 
-    flb_plg_error(ctx->ins, "Failed to create log group");
-    if (c) {
-        flb_http_client_destroy(c);
-    }
+    flb_plg_error(ctx->ins, "Failed to create log group: connection error");
     flb_sds_destroy(body);
     return -1;
 }
@@ -1933,12 +1988,15 @@ int create_log_stream(struct flb_cloudwatch *ctx, struct log_stream *stream,
     }
 
     if (c) {
+        flb_sds_t request_id = get_aws_request_id(c);
+
         flb_plg_debug(ctx->ins,"CreateLogStream http status=%d",
                       c->resp.status);
 
         if (c->resp.status == 200) {
             /* success */
             flb_plg_info(ctx->ins, "Created log stream %s", stream->name);
+            flb_sds_destroy(request_id);
             flb_sds_destroy(body);
             flb_http_client_destroy(c);
             return 0;
@@ -1951,6 +2009,7 @@ int create_log_stream(struct flb_cloudwatch *ctx, struct log_stream *stream,
                 if (strcmp(error, ERR_CODE_ALREADY_EXISTS) == 0) {
                     flb_plg_info(ctx->ins, "Log Stream %s already exists",
                                  stream->name);
+                    flb_sds_destroy(request_id);
                     flb_sds_destroy(body);
                     flb_sds_destroy(error);
                     flb_http_client_destroy(c);
@@ -1958,6 +2017,7 @@ int create_log_stream(struct flb_cloudwatch *ctx, struct log_stream *stream,
                 }
 
                 if (strcmp(error, ERR_CODE_NOT_FOUND) == 0) {
+                    flb_sds_destroy(request_id);
                     flb_sds_destroy(body);
                     flb_sds_destroy(error);
                     flb_http_client_destroy(c);
@@ -1984,21 +2044,40 @@ int create_log_stream(struct flb_cloudwatch *ctx, struct log_stream *stream,
                     return -1;
                 }
                 /* some other error occurred; notify user */
+                if (request_id) {
+                    flb_plg_error(ctx->ins, "CreateLogStream failed: HTTP status=%d, request_id=%s",
+                                 c->resp.status, request_id);
+                }
+                else {
+                    flb_plg_error(ctx->ins, "CreateLogStream failed: HTTP status=%d",
+                                 c->resp.status);
+                }
                 flb_aws_print_error(c->resp.payload, c->resp.payload_size,
                                     "CreateLogStream", ctx->ins);
                 flb_sds_destroy(error);
             }
             else {
                 /* error can not be parsed, print raw response */
-                flb_plg_warn(ctx->ins, "Raw response: %s", c->resp.payload);
+                if (request_id) {
+                    flb_plg_error(ctx->ins, "CreateLogStream failed: HTTP status=%d, request_id=%s",
+                                 c->resp.status, request_id);
+                    flb_plg_warn(ctx->ins, "Raw response: %s", c->resp.payload);
+                }
+                else {
+                    flb_plg_error(ctx->ins, "CreateLogStream failed: HTTP status=%d",
+                                 c->resp.status);
+                    flb_plg_warn(ctx->ins, "Raw response: %s", c->resp.payload);
+                }
             }
         }
+
+        flb_sds_destroy(request_id);
+        flb_http_client_destroy(c);
+        flb_sds_destroy(body);
+        return -1;
     }
 
-    flb_plg_error(ctx->ins, "Failed to create log stream");
-    if (c) {
-        flb_http_client_destroy(c);
-    }
+    flb_plg_error(ctx->ins, "Failed to create log stream: connection error");
     flb_sds_destroy(body);
     return -1;
 }
@@ -2038,6 +2117,8 @@ retry_request:
     }
 
     if (c) {
+        flb_sds_t request_id = get_aws_request_id(c);
+
         flb_plg_debug(ctx->ins, "PutLogEvents http status=%d", c->resp.status);
         flb_plg_debug(ctx->ins, "PutLogEvents http data=%s", c->resp.data);
         flb_plg_debug(ctx->ins, "PutLogEvents http payload=%s", c->resp.payload);
@@ -2048,6 +2129,7 @@ retry_request:
                 if (c->resp.data != NULL && c->resp.data_len > 0) {
                     flb_plg_debug(ctx->ins, "Invalid response: full data: `%.*s`", (int) c->resp.data_len, c->resp.data);
                 }
+                flb_sds_destroy(request_id);
                 flb_http_client_destroy(c);
 
                 if (retry == FLB_TRUE) {
@@ -2060,21 +2142,32 @@ retry_request:
                 return -1;
             }
 
+            flb_sds_destroy(request_id);
             flb_http_client_destroy(c);
             return 0;
         }
 
         /* Check error */
+        if (request_id) {
+            flb_plg_error(ctx->ins, "PutLogEvents failed: HTTP status=%d, request_id=%s",
+                         c->resp.status, request_id);
+        }
+        else {
+            flb_plg_error(ctx->ins, "PutLogEvents failed: HTTP status=%d",
+                         c->resp.status);
+        }
+
         if (c->resp.payload_size > 0) {
             flb_aws_print_error(c->resp.payload, c->resp.payload_size,
                                                   "PutLogEvents", ctx->ins);
         }
+
+        flb_sds_destroy(request_id);
+        flb_http_client_destroy(c);
+        return -1;
     }
 
-    flb_plg_error(ctx->ins, "Failed to send log events");
-    if (c) {
-        flb_http_client_destroy(c);
-    }
+    flb_plg_error(ctx->ins, "Failed to send log events: connection error");
     return -1;
 }
 

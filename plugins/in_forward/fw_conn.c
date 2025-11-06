@@ -71,7 +71,7 @@ int fw_conn_event(void *data)
                 pthread_mutex_unlock(&conn->refcount_mutex);
 
                 /* Only call fw_conn_del if we were the last reference */
-                if (old_refcount == 1) {
+                if (old_refcount == 2) {
                     fw_conn_del(conn);
                 }
                 return -1;
@@ -103,7 +103,7 @@ int fw_conn_event(void *data)
                 pthread_mutex_unlock(&conn->refcount_mutex);
 
                 /* Only call fw_conn_del if we were the last reference */
-                if (old_refcount == 1) {
+                if (old_refcount == 2) {
                     fw_conn_del(conn);
                 }
                 return -1;
@@ -153,14 +153,14 @@ int fw_conn_event(void *data)
 
             if (ret == -1) {
                 /* Only call fw_conn_del if we were the last reference */
-                if (old_refcount == 1) {
+                if (old_refcount == 2) {
                     fw_conn_del(conn);
                 }
                 return -1;
             }
 
             /* Always try to delete in case it was marked for deletion during processing */
-            if (old_refcount == 1) {
+            if (old_refcount == 2) {
                 fw_conn_del(conn);
             }
             return bytes;
@@ -177,7 +177,7 @@ int fw_conn_event(void *data)
             pthread_mutex_unlock(&conn->refcount_mutex);
 
             /* Only call fw_conn_del if we were the last reference */
-            if (old_refcount == 1) {
+            if (old_refcount == 2) {
                 fw_conn_del(conn);
             }
             return -1;
@@ -196,7 +196,7 @@ int fw_conn_event(void *data)
         pthread_mutex_unlock(&conn->refcount_mutex);
 
         /* Only call fw_conn_del if we were the last reference */
-        if (old_refcount == 1) {
+        if (old_refcount == 2) {
             fw_conn_del(conn);
         }
         return -1;

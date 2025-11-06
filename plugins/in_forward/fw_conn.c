@@ -205,7 +205,15 @@ int fw_conn_event(void *data)
     /* Decrement reference count before returning */
     pthread_mutex_lock(&conn->refcount_mutex);
     conn->refcount--;
+    int should_free = (conn->refcount == 0);
+    if (should_free) {
+        connection->user_data = NULL;
+    }
     pthread_mutex_unlock(&conn->refcount_mutex);
+    /* Only call fw_conn_del if we decremented to zero */
+    if (should_free) {
+        fw_conn_del(conn);
+    }
     return 0;
 }
 

@@ -40,13 +40,26 @@ int fw_conn_event(void *data)
     struct mk_event *event;
     struct flb_in_fw_config *ctx;
     struct flb_connection *connection;
+    int should_delete = 0;
 
     connection = (struct flb_connection *) data;
 
     conn = connection->user_data;
 
-    ctx = conn->ctx;
+    /*
+     * Acquire lifecycle lock to prevent concurrent deletion.
+     * This protects against use-after-free when the connection is deleted
+     * while the event handler is still executing.
+     */
+    pthread_mutex_lock(&conn->lifecycle_lock);
 
+    /* Check if connection is marked for deletion */
+    if (conn->being_deleted) {
+        pthread_mutex_unlock(&conn->lifecycle_lock);
+        return -1;
+    }
+
+    ctx = conn->ctx;
     event = &connection->event;
 
     if (event->mask & MK_EVENT_READ) {
@@ -56,12 +69,12 @@ int fw_conn_event(void *data)
             ret = fw_prot_secure_forward_handshake(ctx->ins, conn);
             if (ret == -1) {
                 flb_plg_trace(ctx->ins, "fd=%i closed connection", event->fd);
-                fw_conn_del(conn);
-
-                return -1;
+                should_delete = 1;
+                goto cleanup;
             }
 
             conn->handshake_status = FW_HANDSHAKE_ESTABLISHED;
+            pthread_mutex_unlock(&conn->lifecycle_lock);
             return 0;
         }
 
@@ -72,8 +85,8 @@ int fw_conn_event(void *data)
             if (conn->buf_size >= ctx->buffer_max_size) {
                 flb_plg_warn(ctx->ins, "fd=%i incoming data exceed limit (%lu bytes)",
                              event->fd, (ctx->buffer_max_size));
-                fw_conn_del(conn);
-                return -1;
+                should_delete = 1;
+                goto cleanup;
             }
             else if (conn->buf_size + ctx->buffer_chunk_size > ctx->buffer_max_size) {
                 /* no space to add buffer_chunk_size */
@@ -86,6 +99,7 @@ int fw_conn_event(void *data)
             tmp = flb_realloc(conn->buf, size);
             if (!tmp) {
                 flb_errno();
+                pthread_mutex_unlock(&conn->lifecycle_lock);
                 return -1;
             }
             flb_plg_trace(ctx->ins, "fd=%i buffer realloc %i -> %i",
@@ -107,24 +121,48 @@ int fw_conn_event(void *data)
 
             ret = fw_prot_process(ctx->ins, conn);
             if (ret == -1) {
-                fw_conn_del(conn);
-                return -1;
+                should_delete = 1;
+                goto cleanup;
             }
+            pthread_mutex_unlock(&conn->lifecycle_lock);
             return bytes;
         }
         else {
             flb_plg_trace(ctx->ins, "fd=%i closed connection", event->fd);
-            fw_conn_del(conn);
-            return -1;
+            should_delete = 1;
+            goto cleanup;
         }
     }
 
     if (event->mask & MK_EVENT_CLOSE) {
         flb_plg_trace(ctx->ins, "fd=%i hangup", event->fd);
-        fw_conn_del(conn);
-        return -1;
+        should_delete = 1;
+        goto cleanup;
     }
+
+    pthread_mutex_unlock(&conn->lifecycle_lock);
     return 0;
+
+cleanup:
+    /*
+     * Check if shutdown is handling deletion while we still hold the lock.
+     * This prevents the race where:
+     * 1. We release the lock
+     * 2. Shutdown sets being_deleted=1 and thinks we're done
+     * 3. We call fw_conn_del() trying to acquire conn_mutex
+     * 4. Shutdown also tries to acquire conn_mutex for next iteration
+     * 5. DEADLOCK
+     */
+    int shutdown_in_progress = conn->being_deleted;
+
+    /* Release lock before deleting to avoid deadlock */
+    pthread_mutex_unlock(&conn->lifecycle_lock);
+
+    if (should_delete && !shutdown_in_progress) {
+        fw_conn_del(conn);
+    }
+
+    return -1;
 }
 
 /* Create a new Forward request instance */
@@ -140,6 +178,10 @@ struct fw_conn *fw_conn_add(struct flb_connection *connection, struct flb_in_fw_
 
         return NULL;
     }
+
+    /* Initialize lifecycle lock to prevent use-after-free during deletion */
+    pthread_mutex_init(&conn->lifecycle_lock, NULL);
+    conn->being_deleted = 0;
 
     conn->handshake_status = FW_HANDSHAKE_ESTABLISHED;
     /*
@@ -225,13 +267,48 @@ struct fw_conn *fw_conn_add(struct flb_connection *connection, struct flb_in_fw_
 
 int fw_conn_del(struct fw_conn *conn)
 {
-    /* The downstream unregisters the file descriptor from the event-loop
-     * so there's nothing to be done by the plugin
+    struct flb_in_fw_config *ctx = conn->ctx;
+
+    /*
+     * Step 1: Mark connection as being deleted.
+     * This prevents new event handlers from processing this connection.
+     */
+    pthread_mutex_lock(&conn->lifecycle_lock);
+    conn->being_deleted = 1;
+    pthread_mutex_unlock(&conn->lifecycle_lock);
+
+    /*
+     * Step 2: Unregister from event loop.
+     * The downstream unregisters the file descriptor from the event-loop
+     * so no new events will be fired for this connection.
      */
     flb_downstream_conn_release(conn->connection);
 
-    /* Release resources */
-    mk_list_del(&conn->_head);
+    /*
+     * Step 3: Remove from connections list (if still in it).
+     * During shutdown, fw_conn_del_all() may have already moved this connection
+     * to a temporary list, in which case we should skip removal to avoid deadlock.
+     */
+    pthread_mutex_lock(&ctx->conn_mutex);
+    if (!mk_list_entry_orphan(&conn->_head)) {
+        mk_list_del(&conn->_head);
+    }
+    pthread_mutex_unlock(&ctx->conn_mutex);
+
+    /*
+     * Step 4: Wait for any in-flight event handlers to complete.
+     * By acquiring the lifecycle lock here, we ensure no handler is
+     * currently executing. If a handler is running, this will block
+     * until it completes and releases the lock.
+     */
+    pthread_mutex_lock(&conn->lifecycle_lock);
+    pthread_mutex_unlock(&conn->lifecycle_lock);
+
+    /*
+     * Step 5: Now safe to destroy the lock and free all resources.
+     * No event handlers can be running at this point.
+     */
+    pthread_mutex_destroy(&conn->lifecycle_lock);
 
     /* Release decompression context if it exists */
     if (conn->d_ctx) {
@@ -255,13 +332,95 @@ int fw_conn_del(struct fw_conn *conn)
 
 int fw_conn_del_all(struct flb_in_fw_config *ctx)
 {
-    struct mk_list *tmp;
+    struct mk_list tmp_list;
     struct mk_list *head;
+    struct mk_list *tmp;
     struct fw_conn *conn;
 
-    mk_list_foreach_safe(head, tmp, &ctx->connections) {
+    /*
+     * First, mark ALL connections as being deleted while holding conn_mutex.
+     * This prevents any new fw_conn_del() calls from progressing.
+     */
+    pthread_mutex_lock(&ctx->conn_mutex);
+
+    mk_list_foreach(head, &ctx->connections) {
         conn = mk_list_entry(head, struct fw_conn, _head);
-        fw_conn_del(conn);
+        conn->being_deleted = 1;
+    }
+
+    pthread_mutex_unlock(&ctx->conn_mutex);
+
+    /*
+     * Now collect all connections. Since being_deleted is set,
+     * no handlers will call fw_conn_del() on these connections.
+     */
+    mk_list_init(&tmp_list);
+
+    pthread_mutex_lock(&ctx->conn_mutex);
+
+    /* Move all connections from ctx->connections to tmp_list */
+    mk_list_foreach_safe(head, tmp, &ctx->connections) {
+        mk_list_del(head);
+        mk_list_add(head, &tmp_list);
+    }
+
+    pthread_mutex_unlock(&ctx->conn_mutex);
+
+    /*
+     * Now process each connection without holding conn_mutex.
+     * This allows event handlers to safely call fw_conn_del() on
+     * other connections without deadlocking.
+     */
+    mk_list_foreach_safe(head, tmp, &tmp_list) {
+        conn = mk_list_entry(head, struct fw_conn, _head);
+
+        /* Remove from temporary list */
+        mk_list_del(head);
+
+        /*
+         * Now delete the connection. We pass through a modified
+         * deletion path that doesn't try to remove from list again.
+         *
+         * Handle partially-initialized connections gracefully.
+         * During initialization failures, connections may be in the list
+         * but not fully constructed (e.g., connection pointer may be NULL).
+         */
+
+        /*
+         * Set being_deleted flag to prevent handlers from calling fw_conn_del().
+         * We don't wait for lifecycle_lock to avoid circular dependency deadlock:
+         * - Shutdown waiting for lifecycle_lock
+         * - Handler holding lifecycle_lock, waiting for conn_mutex in fw_conn_del()
+         */
+        conn->being_deleted = 1;
+
+        /*
+         * Close the socket and unregister from event loop.
+         * This interrupts any blocked I/O operations, causing handlers to exit.
+         * Handlers will see being_deleted=1 and skip calling fw_conn_del().
+         */
+        if (conn->connection != NULL) {
+            flb_downstream_conn_release(conn->connection);
+        }
+
+        /* Destroy lock and free resources */
+        pthread_mutex_destroy(&conn->lifecycle_lock);
+
+        if (conn->d_ctx) {
+            flb_decompression_context_destroy(conn->d_ctx);
+        }
+
+        if (conn->helo != NULL) {
+            if (conn->helo->nonce != NULL) {
+                flb_sds_destroy(conn->helo->nonce);
+            }
+            if (conn->helo->salt != NULL) {
+                flb_sds_destroy(conn->helo->salt);
+            }
+            flb_free(conn->helo);
+        }
+        flb_free(conn->buf);
+        flb_free(conn);
     }
 
     return 0;

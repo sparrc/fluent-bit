@@ -60,6 +60,10 @@ struct fw_conn {
     struct flb_in_fw_config *ctx;    /* Plugin configuration context      */
     struct flb_connection *connection;
 
+    /* Lifecycle management to prevent use-after-free */
+    pthread_mutex_t lifecycle_lock;  /* Protects deletion during event handling */
+    int being_deleted;               /* Flag: connection marked for deletion */
+
     struct mk_list _head;
 };
 

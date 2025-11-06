@@ -20,6 +20,7 @@
 #ifndef FLB_IN_FW_CONN_H
 #define FLB_IN_FW_CONN_H
 
+#include <fluent-bit/flb_pthread.h>
 #include <fluent-bit/flb_compression.h>
 
 #define FLB_IN_FW_CHUNK_SIZE      "1024000" /* 1MB */
@@ -41,6 +42,9 @@ struct flb_in_fw_helo;
 
 /* Respresents a connection */
 struct fw_conn {
+    int refcount;                    /* Counts temporary event handler references (starts at 0) */
+    pthread_mutex_t refcount_mutex;  /* Mutex protecting refcount and pending_deletion */
+    int pending_deletion;            /* Tombstone flag: when set, connection will be freed when refcount reaches 0 */
     int status;                      /* Connection status                 */
     int handshake_status;            /* handshake status                 */
 

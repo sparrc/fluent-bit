@@ -45,6 +45,16 @@ int fw_conn_event(void *data)
 
     conn = connection->user_data;
 
+    /* Check if connection is being deleted, and increment reference count */
+    pthread_mutex_lock(&conn->refcount_mutex);
+    if (conn->pending_deletion) {
+        /* Connection is being deleted, don't process this event */
+        pthread_mutex_unlock(&conn->refcount_mutex);
+        return -1;
+    }
+    conn->refcount++;
+    pthread_mutex_unlock(&conn->refcount_mutex);
+
     ctx = conn->ctx;
 
     event = &connection->event;
@@ -56,12 +66,17 @@ int fw_conn_event(void *data)
             ret = fw_prot_secure_forward_handshake(ctx->ins, conn);
             if (ret == -1) {
                 flb_plg_trace(ctx->ins, "fd=%i closed connection", event->fd);
+                pthread_mutex_lock(&conn->refcount_mutex);
+                conn->pending_deletion = 1;
+                pthread_mutex_unlock(&conn->refcount_mutex);
                 fw_conn_del(conn);
-
                 return -1;
             }
 
             conn->handshake_status = FW_HANDSHAKE_ESTABLISHED;
+
+            /* Release event handler's reference */
+            fw_conn_del(conn);
             return 0;
         }
 
@@ -72,6 +87,9 @@ int fw_conn_event(void *data)
             if (conn->buf_size >= ctx->buffer_max_size) {
                 flb_plg_warn(ctx->ins, "fd=%i incoming data exceed limit (%lu bytes)",
                              event->fd, (ctx->buffer_max_size));
+                pthread_mutex_lock(&conn->refcount_mutex);
+                conn->pending_deletion = 1;
+                pthread_mutex_unlock(&conn->refcount_mutex);
                 fw_conn_del(conn);
                 return -1;
             }
@@ -86,6 +104,10 @@ int fw_conn_event(void *data)
             tmp = flb_realloc(conn->buf, size);
             if (!tmp) {
                 flb_errno();
+                pthread_mutex_lock(&conn->refcount_mutex);
+                conn->pending_deletion = 1;
+                pthread_mutex_unlock(&conn->refcount_mutex);
+                fw_conn_del(conn);
                 return -1;
             }
             flb_plg_trace(ctx->ins, "fd=%i buffer realloc %i -> %i",
@@ -106,14 +128,24 @@ int fw_conn_event(void *data)
             conn->buf_len += bytes;
 
             ret = fw_prot_process(ctx->ins, conn);
+
             if (ret == -1) {
+                pthread_mutex_lock(&conn->refcount_mutex);
+                conn->pending_deletion = 1;
+                pthread_mutex_unlock(&conn->refcount_mutex);
                 fw_conn_del(conn);
                 return -1;
             }
+
+            /* Release event handler's reference */
+            fw_conn_del(conn);
             return bytes;
         }
         else {
             flb_plg_trace(ctx->ins, "fd=%i closed connection", event->fd);
+            pthread_mutex_lock(&conn->refcount_mutex);
+            conn->pending_deletion = 1;
+            pthread_mutex_unlock(&conn->refcount_mutex);
             fw_conn_del(conn);
             return -1;
         }
@@ -121,9 +153,15 @@ int fw_conn_event(void *data)
 
     if (event->mask & MK_EVENT_CLOSE) {
         flb_plg_trace(ctx->ins, "fd=%i hangup", event->fd);
+        pthread_mutex_lock(&conn->refcount_mutex);
+        conn->pending_deletion = 1;
+        pthread_mutex_unlock(&conn->refcount_mutex);
         fw_conn_del(conn);
         return -1;
     }
+
+    /* Release event handler's reference */
+    fw_conn_del(conn);
     return 0;
 }
 
@@ -203,6 +241,20 @@ struct fw_conn *fw_conn_add(struct flb_connection *connection, struct flb_in_fw_
     conn->compression_type = FLB_COMPRESSION_ALGORITHM_NONE;
     conn->d_ctx = NULL;
 
+    /* Initialize reference count to 0 (only counts temporary event handler references) */
+    conn->refcount = 0;
+    conn->pending_deletion = 0;
+    ret = pthread_mutex_init(&conn->refcount_mutex, NULL);
+    if (ret != 0) {
+        flb_errno();
+        if (conn->helo != NULL) {
+            flb_free(conn->helo);
+        }
+        flb_free(conn->buf);
+        flb_free(conn);
+        return NULL;
+    }
+
     /* Register instance into the event loop */
     ret = mk_event_add(flb_engine_evl_get(),
                        connection->fd,
@@ -223,8 +275,16 @@ struct fw_conn *fw_conn_add(struct flb_connection *connection, struct flb_in_fw_
     return conn;
 }
 
-int fw_conn_del(struct fw_conn *conn)
+/* Helper function to destroy connection resources */
+static void fw_conn_destroy(struct fw_conn *conn)
 {
+    /* Unregister from event loop first, before freeing anything.
+     * This prevents any queued events from trying to execute fw_conn_event
+     * after the connection has been freed, which would cause a use-after-free
+     * when trying to lock conn->refcount_mutex on line 48 of fw_conn_event.
+     */
+    mk_event_del(flb_engine_evl_get(), &conn->connection->event);
+
     /* The downstream unregisters the file descriptor from the event-loop
      * so there's nothing to be done by the plugin
      */
@@ -247,8 +307,27 @@ int fw_conn_del(struct fw_conn *conn)
         }
         flb_free(conn->helo);
     }
+
+    /* Destroy the mutex before freeing the connection */
+    pthread_mutex_destroy(&conn->refcount_mutex);
+
     flb_free(conn->buf);
     flb_free(conn);
+}
+
+int fw_conn_del(struct fw_conn *conn)
+{
+    int should_free;
+
+    /* Decrement reference count and check if we should free */
+    pthread_mutex_lock(&conn->refcount_mutex);
+    conn->refcount--;
+    should_free = (conn->pending_deletion && conn->refcount == 0);
+    pthread_mutex_unlock(&conn->refcount_mutex);
+
+    if (should_free) {
+        fw_conn_destroy(conn);
+    }
 
     return 0;
 }
@@ -258,10 +337,26 @@ int fw_conn_del_all(struct flb_in_fw_config *ctx)
     struct mk_list *tmp;
     struct mk_list *head;
     struct fw_conn *conn;
+    int should_free;
 
     mk_list_foreach_safe(head, tmp, &ctx->connections) {
         conn = mk_list_entry(head, struct fw_conn, _head);
-        fw_conn_del(conn);
+
+        /* Mark for deletion and check if we should free immediately */
+        pthread_mutex_lock(&conn->refcount_mutex);
+        if (conn->pending_deletion) {
+            pthread_mutex_unlock(&conn->refcount_mutex);
+            continue;
+        }
+        conn->pending_deletion = 1;
+        should_free = (conn->refcount == 0);
+        pthread_mutex_unlock(&conn->refcount_mutex);
+
+        if (should_free) {
+            /* No event handler is currently processing, free immediately */
+            fw_conn_destroy(conn);
+        }
+        /* Otherwise, event handler will see pending_deletion and free when done */
     }
 
     return 0;

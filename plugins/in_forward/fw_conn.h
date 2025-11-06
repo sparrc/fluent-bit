@@ -44,6 +44,7 @@ struct flb_in_fw_helo;
 struct fw_conn {
     int refcount;                    /* Reference counter for safe deletion */
     pthread_mutex_t refcount_mutex;  /* Mutex protecting refcount */
+    int pending_deletion;            /* Flag to prevent repeated fw_conn_del_all decrements */
     int status;                      /* Connection status                 */
     int handshake_status;            /* handshake status                 */
 

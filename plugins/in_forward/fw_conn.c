@@ -220,6 +220,7 @@ struct fw_conn *fw_conn_add(struct flb_connection *connection, struct flb_in_fw_
 
     /* Initialize reference count to 1 (the caller holds the first reference) */
     conn->refcount = 1;
+    conn->pending_deletion = 0;
     ret = pthread_mutex_init(&conn->refcount_mutex, NULL);
     if (ret != 0) {
         flb_errno();
@@ -318,6 +319,16 @@ int fw_conn_del_all(struct flb_in_fw_config *ctx)
 
     mk_list_foreach_safe(head, tmp, &ctx->connections) {
         conn = mk_list_entry(head, struct fw_conn, _head);
+
+        /* Skip if already marked for deletion by a previous fw_conn_del_all call */
+        pthread_mutex_lock(&conn->refcount_mutex);
+        if (conn->pending_deletion) {
+            pthread_mutex_unlock(&conn->refcount_mutex);
+            continue;
+        }
+        conn->pending_deletion = 1;
+        pthread_mutex_unlock(&conn->refcount_mutex);
+
         fw_conn_del(conn, 0);
     }
 

@@ -1,0 +1,93 @@
+---
+# Namespace with maximum length name (63 characters)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: super-long-namespace-for-testing-entity-attributes-max-length1
+  labels:
+    name: super-long-namespace-for-testing-entity-attributes-max-length1
+
+---
+# Log Generator Deployment with maximum length name (63 characters)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: super-long-log-generator-app-name-for-entity-testing-max-len12
+  namespace: super-long-namespace-for-testing-entity-attributes-max-length1
+  labels:
+    app: super-long-log-generator-app-name-for-entity-testing-max-len12
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: super-long-log-generator-app-name-for-entity-testing-max-len12
+  template:
+    metadata:
+      labels:
+        app: super-long-log-generator-app-name-for-entity-testing-max-len12
+        tier: web
+        environment: staging
+        app.kubernetes.io/name: super-long-log-generator-app-name-for-entity-testing-max-len12
+        app.kubernetes.io/version: "1.0.0"
+        app.kubernetes.io/component: frontend
+        app.kubernetes.io/part-of: test-suite
+        app.kubernetes.io/managed-by: kubectl
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+        app.kubernetes.io/description: "Log generator for testing fluent-bit entity collection"
+        team: "platform-team"
+        cost-center: "engineering"
+        oncall: "platform-oncall@example.com"
+    spec:
+      containers:
+        - name: log-gen-1
+          image: public.ecr.aws/docker/library/busybox:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              while true; do
+                echo "{\"message\": \"Test1\"}"
+              done
+          resources:
+            limits:
+              memory: 32Mi
+              cpu: 100m
+            requests:
+              memory: 16Mi
+              cpu: 50m
+        - name: log-gen-2
+          image: public.ecr.aws/docker/library/busybox:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              while true; do
+                echo "{\"message\": \"Test2\"}"
+              done
+          resources:
+            limits:
+              memory: 32Mi
+              cpu: 100m
+            requests:
+              memory: 16Mi
+              cpu: 50m
+        - name: log-gen-3
+          image: public.ecr.aws/docker/library/busybox:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              while true; do
+                echo "{\"message\": \"Test3\"}"
+                sleep 0.1
+              done
+          resources:
+            limits:
+              memory: 32Mi
+              cpu: 100m
+            requests:
+              memory: 16Mi
+              cpu: 50m

@@ -762,6 +762,14 @@ void reset_flush_buf(struct flb_cloudwatch *ctx, struct cw_flush *buf) {
         buf->data_size += strlen(buf->current_stream->name);
         buf->data_size += strlen(buf->current_stream->group);
     }
+    /*
+     * Reserve space for entity metadata when add_entity is enabled.
+     * add_entity adds one struct of "entity" metadata to each PutLogEvents
+     * request.
+     */
+    if (ctx->add_entity) {
+        buf->data_size += PUT_LOG_EVENTS_ENTITY_LEN;
+    }
 }
 
 /* sorts events, constructs a put payload, and then sends */
@@ -1125,7 +1133,7 @@ static void set_entity_field(char **field, struct flb_ra_value *val,
     if (!val || val->type != FLB_RA_STRING) {
         return;
     }
-    
+
     if (found_flag && !*found_flag) {
         if (filter_count) {
             (*filter_count)++;
@@ -1135,11 +1143,11 @@ static void set_entity_field(char **field, struct flb_ra_value *val,
     else if (!found_flag && *field == NULL && filter_count) {
         (*filter_count)++;
     }
-    
+
     if (*field) {
         flb_free(*field);
     }
-    
+
     if (val->storage == FLB_RA_REF) {
         *field = flb_strndup(val->val.ref.buf, val->val.ref.len);
     }
@@ -1182,23 +1190,23 @@ void parse_entity(struct flb_cloudwatch *ctx, entity *entity,
          &entity->root_filter_count, NULL},
         {NULL, NULL, NULL, NULL}
     };
-    
+
     for (i = 0; field_map[i].path; i++) {
         ra = flb_ra_create(field_map[i].path, FLB_FALSE);
         if (!ra) {
             continue;
         }
-        
+
         val = flb_ra_get_value_object(ra, map);
         if (val) {
             set_entity_field(field_map[i].field, val, field_map[i].filter_count,
                            field_map[i].found_flag);
             flb_ra_key_value_destroy(val);
         }
-        
+
         flb_ra_destroy(ra);
     }
-    
+
     if (entity->key_attributes->name == NULL &&
         entity->attributes->name_source == NULL &&
         entity->attributes->workload != NULL) {
@@ -1206,7 +1214,7 @@ void parse_entity(struct flb_cloudwatch *ctx, entity *entity,
                                                  strlen(entity->attributes->workload));
         entity->attributes->name_source = flb_strndup("K8sWorkload", 11);
     }
-    
+
     if (entity->key_attributes->environment == NULL) {
         entity->key_attributes->environment = find_fallback_environment(ctx, entity);
     }

@@ -22,8 +22,8 @@
 
 /*
  * The CloudWatch API documents that the maximum payload is 1,048,576 bytes
- * For reasons that are under investigation, using that number in this plugin
- * leads to API errors. No issues have been seen setting it to 1,000,000 bytes.
+ * For the PutLogEvents API.
+ * See https://docs.aws.amazon.com/AmazonCloudWatchLogs/latest/APIReference/API_PutLogEvents.html
  */
 #define PUT_LOG_EVENTS_PAYLOAD_SIZE    1048576
 #define MAX_EVENTS_PER_PUT             10000
@@ -45,6 +45,14 @@
 
 /* 256KiB minus 26 bytes for the event */
 #define MAX_EVENT_LEN      262118
+
+/*
+ * Reserved buffer space for entity metadata when add_entity is enabled.
+ * Entity includes keyAttributes (Type, Name, Environment, AwsAccountId)
+ * and attributes (PlatformType, Cluster, Namespace, Node, Workload, etc.)
+ * Typical entity size is 500-1500 bytes. 4KB provides safe headroom.
+ */
+#define PUT_LOG_EVENTS_ENTITY_LEN    4096
 
 /* Prefix used for entity fields only */
 #define AWS_ENTITY_PREFIX "aws_entity"

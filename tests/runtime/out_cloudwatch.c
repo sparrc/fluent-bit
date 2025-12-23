@@ -5,6 +5,9 @@
 /* Test data */
 #include "data/td/json_td.h" /* JSON_TD */
 
+/* CloudWatch API constants for buffer size verification */
+#include "../../plugins/out_cloudwatch_logs/cloudwatch_api.h"
+
 #define ERROR_ALREADY_EXISTS "{\"__type\":\"ResourceAlreadyExistsException\"}"
 /* not a real error code, but tests that the code can respond to any error */
 #define ERROR_UNKNOWN "{\"__type\":\"UNKNOWN\"}"
@@ -355,6 +358,33 @@ void flb_test_cloudwatch_already_exists_create_group_put_retention_policy(void)
     flb_destroy(ctx);
 }
 
+/*
+ * Verify that PUT_LOG_EVENTS_ENTITY_LEN constant is properly defined.
+ * This constant reserves buffer space for entity metadata when add_entity
+ * is enabled, preventing buffer overflow in PutLogEvents payload.
+ * See: https://github.com/fluent/fluent-bit/issues/TODO
+ */
+void flb_test_cloudwatch_entity_buffer_size_constant(void)
+{
+    /* Verify the constant is defined and has expected value (4KB) */
+    TEST_CHECK(PUT_LOG_EVENTS_ENTITY_LEN == 4096);
+
+    /*
+     * Verify entity overhead fits within payload limit with room for events.
+     * Entity + header + footer should leave substantial room for log events.
+     */
+    int base_overhead = PUT_LOG_EVENTS_HEADER_LEN + PUT_LOG_EVENTS_FOOTER_LEN;
+    int entity_overhead = PUT_LOG_EVENTS_ENTITY_LEN;
+    int total_overhead = base_overhead + entity_overhead;
+
+    /* Total overhead should be much less than payload size */
+    TEST_CHECK(total_overhead < PUT_LOG_EVENTS_PAYLOAD_SIZE / 10);
+
+    /* Verify at least 900KB remains for actual log events */
+    int remaining = PUT_LOG_EVENTS_PAYLOAD_SIZE - total_overhead;
+    TEST_CHECK(remaining > 900000);
+}
+
 void flb_test_cloudwatch_error_put_retention_policy(void)
 {
     int ret;
@@ -395,6 +425,7 @@ void flb_test_cloudwatch_error_put_retention_policy(void)
 
 /* Test list */
 TEST_LIST = {
+    {"entity_buffer_size_constant", flb_test_cloudwatch_entity_buffer_size_constant },
     {"success", flb_test_cloudwatch_success },
     {"success_with_metrics", flb_test_cloudwatch_success_with_metrics},
     {"group_already_exists", flb_test_cloudwatch_already_exists_create_group },

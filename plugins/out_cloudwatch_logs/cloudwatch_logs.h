@@ -191,6 +191,18 @@ struct flb_cloudwatch {
     struct flb_record_accessor *ra_group;
     struct flb_record_accessor *ra_stream;
 
+    /* Record accessor cache for entity parsing (to avoid per-event allocation) */
+    struct flb_record_accessor *ra_service_name;
+    struct flb_record_accessor *ra_environment;
+    struct flb_record_accessor *ra_namespace;
+    struct flb_record_accessor *ra_host;
+    struct flb_record_accessor *ra_cluster;
+    struct flb_record_accessor *ra_workload;
+    struct flb_record_accessor *ra_name_source;
+    struct flb_record_accessor *ra_platform;
+    struct flb_record_accessor *ra_instance_id;
+    struct flb_record_accessor *ra_account_id;
+
     /* stores log streams we're putting to */
     struct mk_list streams;
 

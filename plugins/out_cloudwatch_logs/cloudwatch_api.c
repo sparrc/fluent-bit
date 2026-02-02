@@ -1156,35 +1156,35 @@ void parse_entity(struct flb_cloudwatch *ctx, entity *entity,
     int i;
 
     struct {
-        const char *path;
+        struct flb_record_accessor **ra;
         char **field;
         int *filter_count;
         int *found_flag;
     } field_map[] = {
-        {"$kubernetes['aws_entity_service_name']", &entity->key_attributes->name,
+        {&ctx->ra_service_name, &entity->key_attributes->name,
          &entity->filter_count, &entity->service_name_found},
-        {"$kubernetes['aws_entity_environment']", &entity->key_attributes->environment,
+        {&ctx->ra_environment, &entity->key_attributes->environment,
          &entity->filter_count, &entity->environment_found},
-        {"$kubernetes['namespace_name']", &entity->attributes->namespace,
+        {&ctx->ra_namespace, &entity->attributes->namespace,
          NULL, NULL},
-        {"$kubernetes['host']", &entity->attributes->node, NULL, NULL},
-        {"$kubernetes['aws_entity_cluster']", &entity->attributes->cluster_name,
+        {&ctx->ra_host, &entity->attributes->node, NULL, NULL},
+        {&ctx->ra_cluster, &entity->attributes->cluster_name,
          &entity->filter_count, NULL},
-        {"$kubernetes['aws_entity_workload']", &entity->attributes->workload,
+        {&ctx->ra_workload, &entity->attributes->workload,
          &entity->filter_count, NULL},
-        {"$kubernetes['aws_entity_name_source']", &entity->attributes->name_source,
+        {&ctx->ra_name_source, &entity->attributes->name_source,
          &entity->filter_count, &entity->name_source_found},
-        {"$kubernetes['aws_entity_platform']", &entity->attributes->platform_type,
+        {&ctx->ra_platform, &entity->attributes->platform_type,
          &entity->filter_count, NULL},
-        {"$aws_entity_ec2_instance_id", &entity->attributes->instance_id,
+        {&ctx->ra_instance_id, &entity->attributes->instance_id,
          &entity->root_filter_count, NULL},
-        {"$aws_entity_account_id", &entity->key_attributes->account_id,
+        {&ctx->ra_account_id, &entity->key_attributes->account_id,
          &entity->root_filter_count, NULL},
         {NULL, NULL, NULL, NULL}
     };
     
-    for (i = 0; field_map[i].path; i++) {
-        ra = flb_ra_create(field_map[i].path, FLB_FALSE);
+    for (i = 0; field_map[i].ra; i++) {
+        ra = *field_map[i].ra;
         if (!ra) {
             continue;
         }
@@ -1195,8 +1195,6 @@ void parse_entity(struct flb_cloudwatch *ctx, entity *entity,
                            field_map[i].found_flag);
             flb_ra_key_value_destroy(val);
         }
-        
-        flb_ra_destroy(ra);
     }
     
     if (entity->key_attributes->name == NULL &&

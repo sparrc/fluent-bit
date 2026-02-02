@@ -387,6 +387,20 @@ static int cb_cloudwatch_init(struct flb_output_instance *ins,
         }
     }
 
+    /* Initialize record accessor cache for entity parsing (thread-safe, one-time init) */
+    if (ctx->add_entity) {
+        ctx->ra_service_name = flb_ra_create("$kubernetes['aws_entity_service_name']", FLB_FALSE);
+        ctx->ra_environment = flb_ra_create("$kubernetes['aws_entity_environment']", FLB_FALSE);
+        ctx->ra_namespace = flb_ra_create("$kubernetes['namespace_name']", FLB_FALSE);
+        ctx->ra_host = flb_ra_create("$kubernetes['host']", FLB_FALSE);
+        ctx->ra_cluster = flb_ra_create("$kubernetes['aws_entity_cluster']", FLB_FALSE);
+        ctx->ra_workload = flb_ra_create("$kubernetes['aws_entity_workload']", FLB_FALSE);
+        ctx->ra_name_source = flb_ra_create("$kubernetes['aws_entity_name_source']", FLB_FALSE);
+        ctx->ra_platform = flb_ra_create("$kubernetes['aws_entity_platform']", FLB_FALSE);
+        ctx->ra_instance_id = flb_ra_create("$aws_entity_ec2_instance_id", FLB_FALSE);
+        ctx->ra_account_id = flb_ra_create("$aws_entity_account_id", FLB_FALSE);
+    }
+
     /* Export context */
     flb_output_set_context(ins, ctx);
 
@@ -508,6 +522,38 @@ void flb_cloudwatch_ctx_destroy(struct flb_cloudwatch *ctx)
 
         if (ctx->ra_stream) {
             flb_ra_destroy(ctx->ra_stream);
+        }
+
+        /* Clean up record accessor cache for entity parsing */
+        if (ctx->ra_service_name) {
+            flb_ra_destroy(ctx->ra_service_name);
+        }
+        if (ctx->ra_environment) {
+            flb_ra_destroy(ctx->ra_environment);
+        }
+        if (ctx->ra_namespace) {
+            flb_ra_destroy(ctx->ra_namespace);
+        }
+        if (ctx->ra_host) {
+            flb_ra_destroy(ctx->ra_host);
+        }
+        if (ctx->ra_cluster) {
+            flb_ra_destroy(ctx->ra_cluster);
+        }
+        if (ctx->ra_workload) {
+            flb_ra_destroy(ctx->ra_workload);
+        }
+        if (ctx->ra_name_source) {
+            flb_ra_destroy(ctx->ra_name_source);
+        }
+        if (ctx->ra_platform) {
+            flb_ra_destroy(ctx->ra_platform);
+        }
+        if (ctx->ra_instance_id) {
+            flb_ra_destroy(ctx->ra_instance_id);
+        }
+        if (ctx->ra_account_id) {
+            flb_ra_destroy(ctx->ra_account_id);
         }
 
         if (ctx->group_name) {

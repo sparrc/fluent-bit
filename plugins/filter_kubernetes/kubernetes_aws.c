@@ -95,14 +95,17 @@ static void extract_service_attribute(msgpack_object *attr_map, const char *key_
     }
 
     val = flb_ra_get_value_object(ra, *attr_map);
-    if (val && val->type == FLB_RA_STRING) {
-        str_val = flb_ra_value_buffer(val, &str_len);
-        if (str_val && str_len < max_len) {
-            memcpy(dest, str_val, str_len);
-            dest[str_len] = '\0';
-            *dest_len = str_len;
-            (*fields)++;
+    if (val) {
+        if (val->type == FLB_RA_STRING) {
+            str_val = flb_ra_value_buffer(val, &str_len);
+            if (str_val && str_len < max_len) {
+                memcpy(dest, str_val, str_len);
+                dest[str_len] = '\0';
+                *dest_len = str_len;
+                (*fields)++;
+            }
         }
+        /* Always destroy val to prevent memory leak when type != FLB_RA_STRING */
         flb_ra_key_value_destroy(val);
     }
     flb_ra_destroy(ra);
@@ -114,7 +117,9 @@ static void parse_pod_service_map(struct flb_kube *ctx, char *api_buf,
     if (ctx->hash_table == NULL || ctx->aws_pod_service_hash_table == NULL) {
         return;
     }
-    flb_plg_debug(ctx->ins, "started parsing pod to service map");
+    flb_plg_debug(ctx->ins, "[pod_service_map] parsing %zu bytes, "
+                  "service_hash_table count before: %d",
+                  api_size, ctx->aws_pod_service_hash_table->total_count);
 
     size_t off = 0;
     int ret;
@@ -183,7 +188,9 @@ static void parse_pod_service_map(struct flb_kube *ctx, char *api_buf,
     }
 
 cleanup:
-    flb_plg_debug(ctx->ins, "ended parsing pod to service map");
+    flb_plg_debug(ctx->ins, "[pod_service_map] parsing complete, "
+                  "service_hash_table count after: %d",
+                  ctx->aws_pod_service_hash_table->total_count);
     msgpack_unpacked_destroy(&api_result);
     if (buffer) {
         flb_free(buffer);

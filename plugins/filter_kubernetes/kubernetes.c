@@ -63,8 +63,13 @@ void *update_pod_service_map(void *arg)
     }
     flb_engine_evl_set(evl);
     while (1) {
+        flb_plg_debug(task_args->ctx->ins, "[pod_service_map] refresh iteration starting, "
+                      "main_hash_table count: %d, service_hash_table count: %d",
+                      task_args->ctx->hash_table ? task_args->ctx->hash_table->total_count : -1,
+                      task_args->ctx->aws_pod_service_hash_table ? task_args->ctx->aws_pod_service_hash_table->total_count : -1);
         fetch_pod_service_map(task_args->ctx,task_args->api_server_url,&metadata_mutex);
-        flb_plg_debug(task_args->ctx->ins, "Updating pod to service map after %d seconds", task_args->ctx->aws_pod_service_map_refresh_interval);
+        flb_plg_debug(task_args->ctx->ins, "[pod_service_map] refresh complete, sleeping %d seconds",
+                      task_args->ctx->aws_pod_service_map_refresh_interval);
         sleep(task_args->ctx->aws_pod_service_map_refresh_interval);
     }
 }
@@ -813,7 +818,7 @@ static int cb_kube_exit(void *data, struct flb_config *config)
     struct flb_kube *ctx;
 
     ctx = data;
-    
+
     flb_kube_conf_destroy(ctx);
     if (background_thread) {
         pthread_cancel(background_thread);
@@ -1109,16 +1114,16 @@ static struct flb_config_map config_map[] = {
      "kubernetes token ttl, until it is reread from the token file. Default: 10m"
     },
     /*
-     * Set TTL for K8s cached metadata 
+     * Set TTL for K8s cached metadata
      */
     {
      FLB_CONFIG_MAP_TIME, "kube_meta_cache_ttl", "0",
      0, FLB_TRUE, offsetof(struct flb_kube, kube_meta_cache_ttl),
-     "configurable TTL for K8s cached metadata. " 
-     "By default, it is set to 0 which means TTL for cache entries is disabled and " 
-     "cache entries are evicted at random when capacity is reached. " 
-     "In order to enable this option, you should set the number to a time interval. " 
-     "For example, set this value to 60 or 60s and cache entries " 
+     "configurable TTL for K8s cached metadata. "
+     "By default, it is set to 0 which means TTL for cache entries is disabled and "
+     "cache entries are evicted at random when capacity is reached. "
+     "In order to enable this option, you should set the number to a time interval. "
+     "For example, set this value to 60 or 60s and cache entries "
      "which have been created more than 60s will be evicted"
     },
     {

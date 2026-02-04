@@ -95,14 +95,17 @@ static void extract_service_attribute(msgpack_object *attr_map, const char *key_
     }
 
     val = flb_ra_get_value_object(ra, *attr_map);
-    if (val && val->type == FLB_RA_STRING) {
-        str_val = flb_ra_value_buffer(val, &str_len);
-        if (str_val && str_len < max_len) {
-            memcpy(dest, str_val, str_len);
-            dest[str_len] = '\0';
-            *dest_len = str_len;
-            (*fields)++;
+    if (val) {
+        if (val->type == FLB_RA_STRING) {
+            str_val = flb_ra_value_buffer(val, &str_len);
+            if (str_val && str_len < max_len) {
+                memcpy(dest, str_val, str_len);
+                dest[str_len] = '\0';
+                *dest_len = str_len;
+                (*fields)++;
+            }
         }
+        /* Always destroy val to prevent memory leak when type != FLB_RA_STRING */
         flb_ra_key_value_destroy(val);
     }
     flb_ra_destroy(ra);
